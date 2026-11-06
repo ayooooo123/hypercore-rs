@@ -507,7 +507,20 @@ impl Core {
 
     /// Replicates this core over a Protomux connection (one call per connection).
     pub fn replicate(&self, mux: &protomux::Mux) {
-        self.replicator().attach(mux);
+        self.replicator().attach(mux, None);
+    }
+
+    /// Replicates over `mux` in answer to the remote open behind `pairing`
+    /// (a Protomux pair request for this core's discovery key).
+    pub fn replicate_paired(&self, mux: &protomux::Mux, pairing: protomux::PairRequest) {
+        self.replicator().attach(mux, Some(pairing));
+    }
+
+    /// Stops replicating: closes every channel of this core.
+    pub fn close(&self) {
+        if let Some(r) = self.inner.replicator.get() {
+            r.destroy();
+        }
     }
 
     pub(crate) fn replicator(&self) -> &Replicator {

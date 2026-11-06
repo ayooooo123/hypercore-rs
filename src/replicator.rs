@@ -94,7 +94,7 @@ fn decode_wire(kind: u64, data: Bytes) -> Result<Option<Wire>, compact_encoding:
 }
 
 enum Cmd {
-    Attach(Mux),
+    Attach(Mux, Option<PairRequest>),
     MakePeer(Mux, Option<PairRequest>),
     Opened {
         peer: PeerId,
@@ -189,7 +189,11 @@ impl<T> Drop for Pending<T> {
 impl Replicator {
     pub(crate) fn new(core: &Core) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
-        let actor = Actor::new(Arc::downgrade(&core.inner), tx.clone());
+        let actor = Actor::new(
+            Arc::downgrade(&core.inner),
+            *core.discovery_key(),
+            tx.clone(),
+        );
         tokio::spawn(actor.run(rx));
         Self {
             tx,
@@ -213,9 +217,10 @@ impl Replicator {
         }
     }
 
-    /// Replicates this core over `mux` (one call per connection).
-    pub fn attach(&self, mux: &Mux) {
-        self.send(Cmd::Attach(mux.clone()));
+    /// Replicates this core over `mux` (one call per connection). `pairing`
+    /// is the remote open that asked for this core, answered by the attach.
+    pub fn attach(&self, mux: &Mux, pairing: Option<PairRequest>) {
+        self.send(Cmd::Attach(mux.clone(), pairing));
     }
 
     pub(crate) fn request_block(
@@ -511,6 +516,7 @@ impl Peer {
 
 struct Actor {
     core: Weak<Inner>,
+    dk: [u8; 32],
     tx: mpsc::UnboundedSender<Cmd>,
     peers: Vec<Option<Peer>>,
     order: Vec<PeerId>,
@@ -560,9 +566,10 @@ fn remove_id(v: &mut Vec<ReqId>, id: ReqId) -> bool {
 }
 
 impl Actor {
-    fn new(core: Weak<Inner>, tx: mpsc::UnboundedSender<Cmd>) -> Self {
+    fn new(core: Weak<Inner>, dk: [u8; 32], tx: mpsc::UnboundedSender<Cmd>) -> Self {
         Self {
             core,
+            dk,
             tx,
             peers: vec![],
             order: vec![],
@@ -637,13 +644,16 @@ impl Actor {
             p.tx.close();
         }
         for mux in &self.attached {
-            mux.unpair(PROTOCOL, None);
+            mux.unpair(PROTOCOL, Some(&self.dk));
         }
     }
 
     async fn handle(&mut self, core: &Core, cmd: Cmd) {
         match cmd {
-            Cmd::Attach(mux) => self.attach(core, mux),
+            Cmd::Attach(mux, pairing) => {
+                self.attach(core, mux);
+                drop(pairing);
+            }
             Cmd::MakePeer(mux, req) => {
                 self.make_peer(core, &mux);
                 drop(req);
