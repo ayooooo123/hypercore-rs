@@ -299,6 +299,8 @@ fn bitfield_pages(
     }
 }
 
+type IdleHook = Box<dyn Fn(&Core) + Send + Sync>;
+
 pub(crate) struct Inner {
     pub storage: CoreStorage,
     pub store: Store,
@@ -310,6 +312,8 @@ pub(crate) struct Inner {
     pub replicator: OnceLock<Replicator>,
     sessions: AtomicUsize,
     active_sessions: AtomicUsize,
+    peers: AtomicUsize,
+    idle_hook: OnceLock<IdleHook>,
 }
 
 /// A shared handle to one open core.
@@ -433,6 +437,8 @@ impl Core {
                 replicator: OnceLock::new(),
                 sessions: AtomicUsize::new(0),
                 active_sessions: AtomicUsize::new(0),
+                peers: AtomicUsize::new(0),
+                idle_hook: OnceLock::new(),
             }),
         };
         Ok(core)
@@ -832,6 +838,34 @@ impl Core {
         self.inner.active_sessions.load(Ordering::Acquire)
     }
 
+    /// Peers currently replicating this core.
+    pub fn peer_count(&self) -> usize {
+        self.inner.peers.load(Ordering::Acquire)
+    }
+
+    /// No sessions and no peers (JS `checkIfIdle`).
+    pub fn is_idle(&self) -> bool {
+        self.session_count() == 0 && self.peer_count() == 0
+    }
+
+    /// Called (once set) whenever the core may have become idle. Corestore
+    /// uses it to garbage collect cores.
+    pub fn set_idle_hook(&self, hook: impl Fn(&Core) + Send + Sync + 'static) {
+        let _ = self.inner.idle_hook.set(Box::new(hook));
+    }
+
+    pub(crate) fn set_peer_count(&self, n: usize) {
+        self.inner.peers.store(n, Ordering::Release);
+    }
+
+    pub(crate) fn check_if_idle(&self) {
+        if self.is_idle()
+            && let Some(hook) = self.inner.idle_hook.get()
+        {
+            hook(self);
+        }
+    }
+
     // Replication
 
     /// Generates the proof (with block value and manifest) answering `req`.
@@ -1166,5 +1200,6 @@ impl Drop for Session {
         {
             r.set_active(false);
         }
+        self.core.check_if_idle();
     }
 }

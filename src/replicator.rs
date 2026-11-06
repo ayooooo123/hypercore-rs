@@ -864,6 +864,7 @@ impl Actor {
         self.if_available -= 1;
         self.had_peers = true;
         self.order.push(id);
+        core.set_peer_count(self.order.len());
         self.update_peer(core, id);
         mux.uncork();
     }
@@ -882,6 +883,7 @@ impl Actor {
         p.removed = true;
         p.wants.destroy();
         self.order.retain(|&x| x != id);
+        core.set_peer_count(self.order.len());
         if self.manifest_peer == Some(id) {
             self.manifest_peer = None;
         }
@@ -901,6 +903,7 @@ impl Actor {
         if reopen && self.downloading {
             self.make_peer(core, &mux);
         }
+        core.check_if_idle();
     }
 
     // Outgoing state
