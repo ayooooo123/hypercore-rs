@@ -54,11 +54,17 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
   byte for byte and verify with the same outcome as in JS (including the requests JS rejects).
   Fork resolution finds the JS fork point.
 - `src/encryption.rs` checks 120 vectors from `hypercore/lib/default-encryption` (`fixtures/encryption`).
-- `tests/replicate_js.rs` (needs `npm install` in `tests/js`): npm hypercore and hypercore-rs over
-  secret-stream on TCP. JS writes and Rust reads, Rust writes and JS reads, with SHA-256 of every
-  byte compared; an encrypted JS core replicates to Rust and Rust follows a JS truncation. The size
-  is `HC_INTEROP_MB` (default 32); the 1 GiB run is
-  `HC_INTEROP_MB=1024 cargo test --release --test replicate_js -- --include-ignored`.
+- `tests/replicate_dht.rs` (needs `npm install` in `tests/js`): npm hypercore on Hyperswarm against
+  hypercore-rs on a peeroxide swarm, on a local `hyperdht/testnet`: topic discovery, holepunch
+  handshake, UDX, secret-stream, as the apps run it. JS writes and Rust reads, Rust writes and JS
+  reads, with SHA-256 of every byte compared. The size is `HC_INTEROP_MB` (default 32); the 1 GiB
+  run is `HC_INTEROP_MB=1024 cargo test --release --test replicate_dht -- --include-ignored --test-threads 1`.
+  It needs the peeroxide fork next to this repo (`../peeroxide`, patched in `Cargo.toml`).
+- `tests/replicate_js.rs`: the same over secret-stream on TCP, plus an encrypted JS core and a JS
+  truncation (reorg). A fast regression check that doesn't involve the DHT.
+- `cargo run --release --example crypto_bench` measures the per-block crypto. On an Apple M-series
+  laptop (aarch64), it does blake2b leaf hashing at ~930 MiB/s, XSalsa20 at ~600 MiB/s (512 KiB
+  blocks), ed25519 signing at ~36k/s and verifying at ~24k/s.
 
 Where JS has a bug the port does not copy it: JS returns `NaN` for byte offsets past the first
 root, and so refuses (or silently drops) some valid seeks; Rust answers them.

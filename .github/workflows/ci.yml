@@ -26,6 +26,10 @@ jobs:
         with:
           repository: ${{ github.repository_owner }}/protomux-rs
           path: protomux-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/peeroxide
+          path: peeroxide
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

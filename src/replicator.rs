@@ -152,6 +152,8 @@ enum Cmd {
         length: u64,
     },
     Destroy,
+    /// Open block waiters, seeks and ranges: leak checks for range servers.
+    Pending(oneshot::Sender<usize>),
 }
 
 /// Handle to a core's replication actor.
@@ -286,6 +288,12 @@ impl Replicator {
         });
         let p = self.pending(rx, waiter);
         async move { p.await.ok_or(CoreError::Closed) }
+    }
+
+    pub(crate) async fn pending_requests(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Pending(reply));
+        rx.await.unwrap_or(0)
     }
 
     pub(crate) fn set_active(&self, active: bool) {
@@ -651,6 +659,10 @@ impl Actor {
 
     async fn handle(&mut self, core: &Core, cmd: Cmd) {
         match cmd {
+            Cmd::Pending(reply) => {
+                let waiters: usize = self.blocks.values().map(|b| b.waiters.len()).sum();
+                let _ = reply.send(waiters + self.seeks.len() + self.ranges.len());
+            }
             Cmd::Attach(mux, pairing) => {
                 self.attach(core, mux);
                 drop(pairing);
@@ -1323,7 +1335,8 @@ impl Actor {
             .position(|s| s.waiters.iter().any(|(w, _)| *w == waiter))
         {
             self.seeks[i].waiters.retain(|(w, _)| *w != waiter);
-            if self.seeks[i].waiters.is_empty() && self.seeks[i].inflight.is_empty() {
+            // A late answer to its inflight request still verifies and stores the nodes.
+            if self.seeks[i].waiters.is_empty() {
                 let s = self.seeks.swap_remove(i);
                 self.drop_handle_wants(core, Handle::Seek(s.id));
             }

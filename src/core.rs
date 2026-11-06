@@ -594,8 +594,15 @@ impl Core {
     }
 
     /// Downloads `[start, end)` (`end = None`: to the end, following appends).
-    pub async fn download(&self, start: u64, end: Option<u64>, linear: bool) -> Result<bool> {
-        self.replicator().request_range(start, end, linear).await
+    /// The range is registered at call time and cancelled when the returned
+    /// future drops, so holding it unpolled keeps a prefetch window open.
+    pub fn download(
+        &self,
+        start: u64,
+        end: Option<u64>,
+        linear: bool,
+    ) -> impl Future<Output = Result<bool>> + Send + use<> {
+        self.replicator().request_range(start, end, linear)
     }
 
     /// Finds the block holding byte `bytes` (of plaintext).
@@ -860,6 +867,11 @@ impl Core {
     /// No sessions and no peers (JS `checkIfIdle`).
     pub fn is_idle(&self) -> bool {
         self.session_count() == 0 && self.peer_count() == 0
+    }
+
+    /// Block gets, seeks and download ranges still waiting on peers.
+    pub async fn pending_requests(&self) -> usize {
+        self.replicator().pending_requests().await
     }
 
     /// Called (once set) whenever the core may have become idle. Corestore

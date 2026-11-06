@@ -5,6 +5,8 @@
   "dependencies": {
     "@hyperswarm/secret-stream": "6.9.2",
     "hypercore": "11.40.3",
-    "hypercore-crypto": "3.7.0"
+    "hypercore-crypto": "3.7.0",
+    "hyperdht": "6.36.0",
+    "hyperswarm": "4.17.2"
   }
 }

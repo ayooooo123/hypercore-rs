@@ -291,6 +291,7 @@ dependencies = [
  "bytes",
  "compact-encoding-rs",
  "ed25519-dalek",
+ "peeroxide",
  "peeroxide-dht",
  "protomux-rs",
  "rand 0.8.8",
@@ -336,8 +337,6 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 [[package]]
 name = "libudx"
 version = "1.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "19ad364afe8d2326f3cb1315c1c729fa62828ae88ba0cfa7bdc36f619d7244ca"
 dependencies = [
  "thiserror",
  "tokio",
@@ -412,10 +411,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "peeroxide"
+version = "1.7.4"
+dependencies = [
+ "libudx",
+ "peeroxide-dht",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "peeroxide-dht"
 version = "1.7.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75f8debc144b0d2efebd0e49e7d0a933dcd9c3e7e7d32caa31d1d20a7c598dbf"
 dependencies = [
  "blake2",
  "chacha20",

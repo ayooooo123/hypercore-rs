@@ -27,4 +27,11 @@ serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.40", features = ["full"] }
 peeroxide-dht = "1.7.4"
+peeroxide = "1.7.4"
 sha2 = "0.10"
+
+# Our fork: UDX write pipelining, C-compatible pacing and SACKs, reachability check (see ../peeroxide).
+[patch.crates-io]
+peeroxide = { path = "../peeroxide/peeroxide" }
+peeroxide-dht = { path = "../peeroxide/peeroxide-dht" }
+libudx = { path = "../peeroxide/libudx" }
