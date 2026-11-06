@@ -1,0 +1,30 @@
+[package]
+name = "hypercore-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT OR Apache-2.0"
+description = "Hypercore 11 for Rust: signed merkle logs, proofs and replication, wire-compatible with npm hypercore"
+keywords = ["hypercore", "p2p", "holepunch", "merkle"]
+categories = ["network-programming", "cryptography"]
+
+[lib]
+name = "hypercore"
+
+[dependencies]
+blake2b_simd = "1"
+bytes = "1"
+compact-encoding-rs = { path = "../compact-encoding-rs" }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+protomux-rs = { path = "../protomux-rs" }
+rand = "0.8"
+redb = "4"
+salsa20 = "0.10"
+tokio = { version = "1.40", features = ["sync", "rt", "macros", "time"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1.40", features = ["full"] }
+peeroxide-dht = "1.7.4"
+sha2 = "0.10"

@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: hypercore-rs
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: hypercore-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/compact-encoding-rs
+          path: compact-encoding-rs
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/protomux-rs
+          path: protomux-rs
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: for d in tests/js fixtures/gen; do [ -f $d/package.json ] && (cd $d && npm ci); done; true
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -- --include-ignored

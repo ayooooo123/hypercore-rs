@@ -1,0 +1,13 @@
+{
+  "name": "hypercore-rs-tree-fixtures",
+  "private": true,
+  "description": "Generates ../tree.json (merkle tree, signatures and proofs) from npm hypercore",
+  "scripts": {
+    "gen": "node gen-tree.js > ../tree.json"
+  },
+  "dependencies": {
+    "compact-encoding": "3.5.2",
+    "hypercore": "11.39.5",
+    "hypercore-crypto": "3.7.0"
+  }
+}

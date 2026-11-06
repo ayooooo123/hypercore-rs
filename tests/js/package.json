@@ -1,0 +1,10 @@
+{
+  "name": "hypercore-rs-interop",
+  "private": true,
+  "description": "npm hypercore peer driven by tests/replicate_js.rs",
+  "dependencies": {
+    "@hyperswarm/secret-stream": "6.9.2",
+    "hypercore": "11.39.5",
+    "hypercore-crypto": "3.7.0"
+  }
+}
