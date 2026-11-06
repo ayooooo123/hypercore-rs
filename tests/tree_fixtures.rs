@@ -1,4 +1,4 @@
-//! `fixtures/tree.json` comes from npm hypercore 11.39.5 (`fixtures/gen`). The
+//! `fixtures/tree.json` comes from npm hypercore 11.40.3 (`fixtures/gen`). The
 //! Rust tree must hash, sign, prove and verify exactly as JS does.
 
 use std::collections::HashMap;
@@ -249,9 +249,8 @@ fn proofs_are_byte_identical_and_verify() {
                     "{}",
                     case["request"]
                 );
-                if let Some(u) = &data.upgrade {
-                    let end = merkle::upgrade_length(u);
-                    assert_eq!(batch.hash(), history[end as usize - 1].hash());
+                if data.upgrade.is_some() {
+                    assert_eq!(batch.hash(), history[batch.length as usize - 1].hash());
                 }
             }
             (_, Err(e)) => panic!("verify {}: {e}", case["request"]),
@@ -342,5 +341,51 @@ fn reorg_finds_the_fork_point() {
         ops.delete.contains(&39),
         "parent spanning the fork point is dropped: {:?}",
         ops.delete
+    );
+}
+
+#[test]
+fn upgrades_made_for_another_length_are_refitted() {
+    let f = fixture();
+    let blocks = blocks(&f, "blocks");
+    let (_, _, history) = build(&blocks);
+    // A JS upgrade from length 5 to the head, applied by a peer that is at 16 by now.
+    let case = f["proofs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| {
+            c["remoteLength"] == 5
+                && c["request"].as_object().unwrap().len() == 1
+                && c["request"]["upgrade"]["length"] == 32
+        })
+        .expect("plain upgrade from 5");
+    let data: Data = decode(unhex(case["data"].as_str().unwrap())).unwrap();
+    let (local, store, _) = build(&blocks[..16]);
+    assert!(
+        merkle::verify(&local, &store, &data).is_err(),
+        "does not apply as is"
+    );
+    let refitted = merkle::refit(&local, &store, &data)
+        .unwrap()
+        .expect("nodes suffice");
+    assert_eq!(refitted.upgrade.as_ref().unwrap().start, 16);
+    let batch = merkle::verify(&local, &store, &refitted).unwrap();
+    assert_eq!(batch.length, 37);
+    assert_eq!(batch.hash(), history[36].hash());
+
+    // From further back the carried nodes cannot bridge the gap.
+    let (behind, behind_store, _) = build(&blocks[..1]);
+    let short = f["proofs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["remoteLength"] == 20 && c["request"].as_object().unwrap().len() == 1)
+        .unwrap();
+    let data: Data = decode(unhex(short["data"].as_str().unwrap())).unwrap();
+    assert!(
+        merkle::refit(&behind, &behind_store, &data)
+            .unwrap()
+            .is_none()
     );
 }

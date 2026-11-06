@@ -118,22 +118,27 @@ pub fn total_span(nodes: &[Node]) -> u64 {
 struct NodeQueue<'a> {
     nodes: &'a [Node],
     i: usize,
-    extra: Option<Node>,
+    root: Option<Node>,
 }
 
 impl<'a> NodeQueue<'a> {
-    fn new(nodes: &'a [Node], extra: Option<Node>) -> Self {
-        Self { nodes, i: 0, extra }
+    fn new(nodes: &'a [Node], root: Option<Node>) -> Self {
+        Self { nodes, i: 0, root }
     }
 
     fn len(&self) -> usize {
-        self.nodes.len() - self.i + self.extra.is_some() as usize
+        self.nodes.len() - self.i + self.root.is_some() as usize
+    }
+
+    fn peek(&self, index: u64) -> bool {
+        self.root.is_some_and(|r| r.index == index)
+            || self.nodes.get(self.i).is_some_and(|n| n.index == index)
     }
 
     fn shift(&mut self, index: u64) -> Result<Node> {
-        if let Some(extra) = self.extra.filter(|e| e.index == index) {
-            self.extra = None;
-            return Ok(extra);
+        if let Some(root) = self.root.filter(|e| e.index == index) {
+            self.root = None;
+            return Ok(root);
         }
         let Some(node) = self.nodes.get(self.i) else {
             return Err(invalid(format!("Expected node {index}, got (nil)")));
@@ -668,9 +673,14 @@ pub fn verify_fully_remote(state: &TreeState, proof: &Data) -> Result<Batch> {
     batch.length = 0;
     batch.ancestors = 0;
     batch.byte_length = 0;
-    let unverified = verify_tree(proof, &mut batch.nodes)?;
-    if proof.upgrade.is_some() {
-        verify_upgrade(proof, unverified, &mut batch)?;
+    let mut unverified = verify_tree(proof, &mut batch.nodes)?;
+    if proof.upgrade.is_some() && verify_upgrade(proof, unverified, &mut batch)? {
+        unverified = None;
+    }
+    if unverified.is_some() {
+        return Err(MerkleError::InvalidProof(
+            "Proof not covered by the upgrade".into(),
+        ));
     }
     Ok(batch)
 }
@@ -758,6 +768,9 @@ fn verify_upgrade(proof: &Data, block_root: Option<Node>, batch: &mut Batch) -> 
         .upgrade
         .as_ref()
         .ok_or_else(|| invalid("Expected upgrade proof"))?;
+    if upgrade.length == 0 {
+        return Err(invalid("Invalid upgrade"));
+    }
     if let Some(p) = &batch.prologue
         && upgrade.start < p.length
         && (upgrade.start != 0 || upgrade.length < p.length)
@@ -804,33 +817,36 @@ fn verify_upgrade(proof: &Data, block_root: Option<Node>, batch: &mut Batch) -> 
         return Err(MerkleError::InvalidProof("Invalid hash".into()));
     }
 
-    let extra = &upgrade.additional_nodes;
+    // A block past the upgrade is proven by the additional nodes (hypercore 11.40).
+    let past = q.root.filter(|r| r.index >= to);
+    if past.is_some() {
+        q.root = None;
+    }
+    let mut additional = NodeQueue::new(&upgrade.additional_nodes, past);
     let last = batch
         .roots
         .last()
         .ok_or_else(|| MerkleError::InvalidProof("empty upgrade".into()))?;
     ite.seek(last.index);
-    let mut i = 0;
-    while i < extra.len() && extra[i].index == ite.sibling() {
-        batch.append_root(extra[i], &mut ite);
-        i += 1;
+    while additional.len() > 0 && additional.peek(ite.sibling()) {
+        let node = additional.shift(ite.index)?;
+        batch.append_root(node, &mut ite);
     }
-    while i < extra.len() {
-        let node = extra[i];
-        i += 1;
-        while node.index != ite.index {
+    while additional.len() > 0 {
+        while !additional.peek(ite.index) {
             if ite.factor == 2 {
-                return Err(invalid(format!("Unexpected node: {}", node.index)));
+                return Err(invalid("Unexpected additional node"));
             }
             ite.left_child();
         }
+        let node = additional.shift(ite.index)?;
         batch.append_root(node, &mut ite);
         ite.sibling();
     }
 
     batch.signature = upgrade.signature.clone();
     batch.fork = proof.fork;
-    Ok(q.extra.is_none())
+    Ok(q.root.is_none())
 }
 
 /// What the remote asked to be proven.
@@ -896,7 +912,12 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
     if from >= to || to > head {
         return Err(invalid("Invalid upgrade"));
     }
-    if req.seek.is_some() && upgrade.is_some() && node.as_ref().is_some_and(|n| n.index >= from) {
+    if req.seek.is_some()
+        && node
+            .as_ref()
+            .zip(upgrade)
+            .is_some_and(|(n, u)| n.last_index >= u.start)
+    {
         return Err(invalid(
             "Cannot both do a seek and block/hash request when upgrading",
         ));
@@ -931,6 +952,7 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
     }
 
     if upgrade.is_some() {
+        let mut nodes = vec![];
         upgrade_proof(
             store,
             node.as_ref(),
@@ -939,9 +961,23 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
             to,
             sub_tree,
             &mut p,
+            &mut nodes,
         )?;
+        p.upgrade = Some(nodes);
         if head > to {
-            additional_upgrade_proof(store, to, head, &mut p)?;
+            let mut nodes = vec![];
+            let sub = if seek.is_some() { head } else { sub_tree };
+            upgrade_proof(
+                store,
+                node.as_ref(),
+                seek.is_some(),
+                to,
+                head,
+                sub,
+                &mut p,
+                &mut nodes,
+            )?;
+            p.additional = Some(nodes);
         }
     }
 
@@ -1043,6 +1079,7 @@ fn block_and_seek_proof(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upgrade_proof(
     store: &impl NodeStore,
     node: Option<&Indexed>,
@@ -1051,10 +1088,9 @@ fn upgrade_proof(
     to: u64,
     sub_tree: u64,
     p: &mut Pending,
+    nodes: &mut Vec<Node>,
 ) -> Result<()> {
-    if from == 0 {
-        p.upgrade = Some(vec![]);
-    }
+    let mut connected = from == 0;
     let mut ite = Iter::new(0);
     while ite.full_root(to) {
         if ite.index + ite.factor / 2 < from {
@@ -1062,8 +1098,8 @@ fn upgrade_proof(
             continue;
         }
         // connect to the tree the remote already has
-        if p.upgrade.is_none() && from >= 2 && ite.contains(from - 2) {
-            p.upgrade = Some(vec![]);
+        if !connected && from >= 2 && ite.contains(from - 2) {
+            connected = true;
             let root = ite.index;
             let target = from - 2;
             ite.seek(target);
@@ -1080,8 +1116,7 @@ fn upgrade_proof(
                     if p.node.is_none() && p.seek.is_none() && ite.contains(sub_tree) {
                         block_and_seek_proof(store, node, seek, sub_tree, ite.index, p)?;
                     } else {
-                        let n = store.node_or_error(ite.index)?;
-                        p.upgrade.as_mut().expect("set").push(n);
+                        nodes.push(store.node_or_error(ite.index)?);
                     }
                 }
                 ite.parent();
@@ -1089,62 +1124,14 @@ fn upgrade_proof(
             ite.next_tree();
             continue;
         }
-        if p.upgrade.is_none() {
-            p.upgrade = Some(vec![]);
-        }
+        connected = true;
         // a requested subtree inside this root replaces the root itself
         if p.node.is_none() && p.seek.is_none() && ite.contains(sub_tree) {
             block_and_seek_proof(store, node, seek, sub_tree, ite.index, p)?;
             ite.next_tree();
             continue;
         }
-        let n = store.node_or_error(ite.index)?;
-        p.upgrade.as_mut().expect("set").push(n);
-        ite.next_tree();
-    }
-    Ok(())
-}
-
-fn additional_upgrade_proof(
-    store: &impl NodeStore,
-    from: u64,
-    to: u64,
-    p: &mut Pending,
-) -> Result<()> {
-    if from == 0 {
-        p.additional = Some(vec![]);
-    }
-    let mut ite = Iter::new(0);
-    while ite.full_root(to) {
-        if ite.index + ite.factor / 2 < from {
-            ite.next_tree();
-            continue;
-        }
-        if p.additional.is_none() && from >= 2 && ite.contains(from - 2) {
-            let mut out = vec![];
-            let root = ite.index;
-            let target = from - 2;
-            ite.seek(target);
-            let mut cnt = 0;
-            while ite.index != root {
-                cnt += 1;
-                if cnt >= 1024 {
-                    return Err(invalid(format!(
-                        "Bad arguments to additionalUpgradeProof root={root} target={target}"
-                    )));
-                }
-                ite.sibling();
-                if ite.index > target {
-                    out.push(store.node_or_error(ite.index)?);
-                }
-                ite.parent();
-            }
-            p.additional = Some(out);
-            ite.next_tree();
-            continue;
-        }
-        let n = store.node_or_error(ite.index)?;
-        p.additional.get_or_insert_with(Vec::new).push(n);
+        nodes.push(store.node_or_error(ite.index)?);
         ite.next_tree();
     }
     Ok(())
@@ -1269,10 +1256,102 @@ pub fn max_missing_nodes(index: u64, length: u64) -> u64 {
     cnt
 }
 
-/// `MerkleTree.upgradeLength`.
-pub fn upgrade_length(upgrade: &DataUpgrade) -> u64 {
-    match upgrade.additional_nodes.last() {
-        Some(last) => flat_tree::right_span(last.index) / 2 + 1,
-        None => upgrade.start + upgrade.length,
+/// The largest length JS can represent (`2 ** 52`).
+const MAX_LENGTH: u64 = 1 << 52;
+/// A proof needs at most two nodes per level of a 64-level tree.
+const MAX_NODES: usize = 2 * 64;
+
+/// Serves only the nodes a proof carries, noting any lookup it cannot answer.
+struct ProofNodes {
+    nodes: HashMap<u64, Node>,
+    insufficient: std::cell::Cell<bool>,
+}
+
+impl NodeStore for ProofNodes {
+    fn node(&self, index: u64) -> Result<Option<Node>> {
+        let n = self.nodes.get(&index).copied();
+        if n.is_none() {
+            self.insufficient.set(true);
+        }
+        Ok(n)
+    }
+}
+
+/// `MerkleTree.refit` (hypercore 11.40): rewrites an upgrade proof made for
+/// another length as if requested from ours, using only the nodes it carries.
+/// `Ok(None)`: those nodes cannot bridge our length.
+pub fn refit(state: &TreeState, store: &impl NodeStore, proof: &Data) -> Result<Option<Data>> {
+    let Some(upgrade) = proof
+        .upgrade
+        .as_ref()
+        .filter(|u| proof.seek.is_none() && u.start != state.length)
+    else {
+        return Ok(Some(proof.clone()));
+    };
+    let too_many = |n: &[Node]| n.len() > MAX_NODES;
+    if proof.block.as_ref().is_some_and(|b| too_many(&b.nodes))
+        || proof.hash.as_ref().is_some_and(|h| too_many(&h.nodes))
+        || too_many(&upgrade.nodes)
+        || too_many(&upgrade.additional_nodes)
+    {
+        return Err(invalid("Too many nodes"));
+    }
+    let mut carried = vec![];
+    verify_tree(proof, &mut carried)?;
+    carried.extend_from_slice(&upgrade.nodes);
+    carried.extend_from_slice(&upgrade.additional_nodes);
+    let length = carried
+        .iter()
+        .map(|n| flat_tree::right_span(n.index) / 2 + 1)
+        .max()
+        .unwrap_or(0);
+    if length > MAX_LENGTH {
+        return Err(invalid("Upgrade is out of bounds"));
+    }
+    let nodes = ProofNodes {
+        nodes: carried.into_iter().map(|n| (n.index, n)).collect(),
+        insufficient: false.into(),
+    };
+
+    let mut tree = TreeState {
+        roots: vec![],
+        byte_length: 0,
+        ..state.clone()
+    };
+    let mut req = ProofRequest {
+        block: proof.block.as_ref().map(|b| RequestBlock {
+            index: b.index,
+            nodes: 0,
+        }),
+        hash: proof.hash.as_ref().map(|h| RequestBlock {
+            index: h.index,
+            nodes: 0,
+        }),
+        ..Default::default()
+    };
+    if let Some(b) = req.block.as_mut() {
+        b.nodes = missing_nodes(store, 2 * b.index, state.length)?;
+    }
+    if let Some(h) = req.hash.as_mut() {
+        h.nodes = missing_nodes(store, h.index, state.length)?;
+    }
+    if length > state.length {
+        req.upgrade = Some(RequestUpgrade {
+            start: state.length,
+            length: length - state.length,
+        });
+        tree.length = length;
+        tree.signature = upgrade.signature.clone();
+    }
+    match self::proof(&tree, &nodes, &req) {
+        Ok(mut out) => {
+            if let (Some(b), Some(src)) = (out.block.as_mut(), proof.block.as_ref()) {
+                b.value = src.value.clone();
+            }
+            out.manifest = proof.manifest.clone();
+            Ok(Some(out))
+        }
+        Err(_) if nodes.insufficient.get() => Ok(None),
+        Err(e) => Err(e),
     }
 }

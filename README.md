@@ -49,7 +49,7 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
 
 ## Compatibility
 
-- `tests/tree_fixtures.rs`: a core written by npm hypercore 11.39.5 (`fixtures/gen`). Tree hashes,
+- `tests/tree_fixtures.rs`: a core written by npm hypercore 11.40.3 (`fixtures/gen`). Tree hashes,
   roots, nodes, byte offsets and signatures match at every length; 100+ JS proofs are reproduced
   byte for byte and verify with the same outcome as in JS (including the requests JS rejects).
   Fork resolution finds the JS fork point.

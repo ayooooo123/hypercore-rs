@@ -165,10 +165,11 @@ impl RemoteBitfield {
                 local = 0;
             }
             if !val && pages_len < PAGES_PER_SEGMENT {
-                return Some(
-                    seg.saturating_mul(BITS_PER_SEGMENT)
-                        .saturating_add(pages_len * BITS_PER_PAGE),
-                );
+                // hypercore 11.40: never report an unset bit before `position`.
+                let end = seg
+                    .saturating_mul(BITS_PER_SEGMENT)
+                    .saturating_add(pages_len * BITS_PER_PAGE);
+                return Some(end.max(position));
             }
 
             idx = seg + 1;
@@ -452,7 +453,7 @@ mod tests {
 
     #[test]
     fn insert_pages_length_tail_matches_js() {
-        // Values verified against hypercore 11.39.5 remote-bitfield.js.
+        // Values verified against hypercore 11.40.3 remote-bitfield.js.
         let mut bitfield = RemoteBitfield::new();
         bitfield.insert(5 * BITS_PER_PAGE, &[0xffff_ffff]);
 
@@ -460,8 +461,8 @@ mod tests {
         assert_eq!(bitfield.segment_pages[&0], 6);
         assert_eq!(
             bitfield.find_first(false, 10 * BITS_PER_PAGE),
-            Some(6 * BITS_PER_PAGE),
-            "JS caps at pagesLength, even before the position"
+            Some(10 * BITS_PER_PAGE),
+            "past pagesLength the first unset bit is the position itself (11.40)"
         );
         assert_eq!(
             bitfield.find_first(false, 5 * BITS_PER_PAGE + 8),
@@ -589,7 +590,7 @@ mod tests {
                     Some(&len) => {
                         let page_in_segment = (from - seg * BITS_PER_SEGMENT) / BITS_PER_PAGE;
                         if page_in_segment >= len {
-                            return Some(seg * BITS_PER_SEGMENT + len * BITS_PER_PAGE);
+                            return Some((seg * BITS_PER_SEGMENT + len * BITS_PER_PAGE).max(from));
                         }
                         let end = seg * BITS_PER_SEGMENT + len * BITS_PER_PAGE;
                         if let Some(bit) = self.first_gap(from, end) {

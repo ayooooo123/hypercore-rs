@@ -98,6 +98,16 @@ async function main() {
     requests.push({ remoteLength: L, block: { index: 0, nodes: max(0, L) }, seek: { bytes: 10, padding: 0 } })
     requests.push({ remoteLength: L, block: { index: L - 1, nodes: 2 }, seek: { bytes: 400, padding: 0 } })
   }
+  // blocks and hashes past a partial upgrade: 11.40 carries them in the additional nodes
+  for (const L of [0, 5, 16]) {
+    for (const [i, len] of [[30, 10], [36, 4], [N - 1, 1], [20, 3]]) {
+      if (L + len >= N || i < L + len) continue
+      requests.push({ remoteLength: L, block: { index: i, nodes: 0 }, upgrade: { start: L, length: len } })
+      requests.push({ remoteLength: L, hash: { index: 2 * i, nodes: 0 }, upgrade: { start: L, length: len } })
+    }
+    requests.push({ remoteLength: L, seek: { bytes: core.byteLength - 10, padding: 0 }, upgrade: { start: L, length: 3 } })
+  }
+  requests.push({ remoteLength: 5, upgrade: { start: 5, length: 0 } })
   // requests JS rejects
   requests.push({ remoteLength: 5, upgrade: { start: 5, length: N } })
   requests.push({ remoteLength: 5, block: { index: 30, nodes: 0 }, seek: { bytes: 3, padding: 0 }, upgrade: { start: 5, length: 32 } })

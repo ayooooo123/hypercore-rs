@@ -6,6 +6,6 @@
     "gen": "node gen.js > ../encryption.json"
   },
   "dependencies": {
-    "hypercore": "11.39.5"
+    "hypercore": "11.40.3"
   }
 }

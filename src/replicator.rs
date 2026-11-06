@@ -503,10 +503,11 @@ impl Peer {
         index < self.remote_contiguous || self.remote_bitfield.get(index)
     }
 
+    /// JS `remoteContiguousLength`: the first block the remote lacks.
     fn remote_contiguous_length(&self) -> u64 {
         self.remote_bitfield
             .find_first(false, self.remote_contiguous)
-            .unwrap_or(u64::MAX)
+            .unwrap_or(self.remote_contiguous)
     }
 
     fn send<T: Codec>(&mut self, kind: u64, msg: &T) -> bool {
@@ -1091,7 +1092,7 @@ impl Actor {
             self.reset_missing_block(core, id, start);
             return;
         }
-        let seg = crate::bitfield::BITS_PER_SEGMENT;
+        let seg = crate::bitfield::BITS_PER_PAGE;
         let Some(p) = self.peer_mut(id) else { return };
         let rem = start & (seg - 1);
         start -= rem;
@@ -2187,6 +2188,7 @@ impl Actor {
         }
         p.remote_bitfield.insert(m.start, &m.bitfield);
         p.missing_blocks.insert(m.start, &m.bitfield);
+        p.remote_contiguous = p.remote_contiguous_length();
         let bits = m.bitfield.len() as u64 * 32;
         self.clear_local_range(core, id, m.start, bits);
         self.update_peer(core, id);
@@ -2213,9 +2215,9 @@ impl Actor {
         if m.start == 0 && !m.drop {
             if m.length > p.remote_contiguous {
                 p.remote_contiguous = m.length;
-                if p.remote_fork == fork {
-                    core.set_remote_contiguous_length(m.length);
-                }
+            }
+            if p.remote_fork == fork {
+                core.set_remote_contiguous_length(m.length);
             }
         } else if m.length == 1 {
             p.remote_bitfield.set(m.start, has);
@@ -2231,10 +2233,19 @@ impl Actor {
             {
                 p.remote_bitfield.set_range(rs, range_end, has);
                 p.missing_blocks.set_range(rs, range_end, has);
+                if has && m.start <= p.remote_contiguous && p.remote_contiguous < range_end {
+                    p.remote_contiguous = range_end;
+                }
                 if has {
                     self.clear_local_range(core, id, rs, range_end - rs);
                 }
             }
+        }
+        if let Some(p) = self.peer_mut(id)
+            && has
+            && m.start <= p.remote_contiguous
+        {
+            p.remote_contiguous = p.remote_contiguous_length();
         }
         if !m.drop {
             self.update_peer(core, id);
@@ -2619,7 +2630,7 @@ impl Actor {
         let off = start + rand::thread_rng().gen_range(0..len);
         for i in 0..len {
             let mut index = off + i;
-            if index > end {
+            if index >= end {
                 index -= len;
             }
             let Some(p) = self.peer(id) else { return false };

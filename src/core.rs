@@ -793,7 +793,8 @@ impl Core {
                     break;
                 }
                 sb.delete_tree_node(a);
-                sb.delete_tree_node(b);
+                // the whole sibling subtree is unused (hypercore 11.40)
+                sb.delete_tree_range(l, r + 1);
             }
             bitfield_pages(&st.bitfield, start, end, false, &mut sb);
             let contig = st.header.contiguous_length.min(start);
@@ -913,6 +914,10 @@ impl Core {
             if proof.fork != st.tree.fork {
                 return Ok(None);
             }
+            // hypercore 11.40: an upgrade made for another length is refitted to ours.
+            let Some(proof) = merkle::refit(&st.tree, &self.inner.storage, &proof)? else {
+                return Ok(None);
+            };
             let mut batch = merkle::verify(&st.tree, &self.inner.storage, &proof)?;
             if batch.upgraded && batch.length <= st.tree.length {
                 downgrade(&mut batch, &self.inner.storage)?;
