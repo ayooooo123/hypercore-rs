@@ -1300,6 +1300,7 @@ impl Core {
             let mut header = st.header.clone();
             if let Some(m) = &learned {
                 header.manifest = Some(m.clone());
+                header.write_auth(&mut sb);
             }
             if batch.upgraded {
                 header.fork = batch.fork;

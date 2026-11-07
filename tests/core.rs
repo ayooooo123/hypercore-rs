@@ -235,3 +235,49 @@ async fn inactive_sessions_let_the_channel_go_idle() {
     assert!(timeout(T, b.update(None)).await.unwrap().unwrap());
     assert_eq!(b.length(), 1);
 }
+
+#[tokio::test]
+async fn a_downloaded_manifest_survives_reopening() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (sa, sb) = (
+        Store::open(da.path()).unwrap(),
+        Store::open(db.path()).unwrap(),
+    );
+    let kp = KeyPair::from_seed(&[9; 32]);
+    let manifest = hypercore::verifier::default_signer_manifest(kp.public_key);
+    let a = Core::open(
+        &sa,
+        CoreOptions {
+            key_pair: Some(kp),
+            manifest: Some(manifest.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    a.append(&[b"x".as_slice()]).await.unwrap();
+    let b = reader(&sb, a.key());
+    let session = b.session(true);
+    let (ma, mb) = link();
+    a.replicate(&ma);
+    b.replicate(&mb);
+    let got = timeout(T, b.get(0, GetOptions::default()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got[..], b"x");
+    assert_eq!(
+        b.manifest(),
+        Some(manifest.clone()),
+        "the proof carried the manifest"
+    );
+    drop(session);
+    b.close();
+    let reopened =
+        Core::open_by_discovery_key(&sb, b.discovery_key(), CoreOptions::default()).unwrap();
+    assert_eq!(
+        reopened.manifest(),
+        Some(manifest),
+        "the learned manifest is stored, not just remembered"
+    );
+}
