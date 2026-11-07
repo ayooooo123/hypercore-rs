@@ -94,7 +94,11 @@ fn decode_wire(kind: u64, data: Bytes) -> Result<Option<Wire>, compact_encoding:
 }
 
 enum Cmd {
-    Attach(Mux, Option<PairRequest>),
+    Attach(
+        Mux,
+        mpsc::UnboundedReceiver<PairRequest>,
+        Option<PairRequest>,
+    ),
     MakePeer(Mux, Option<PairRequest>),
     Opened {
         peer: PeerId,
@@ -160,6 +164,7 @@ enum Cmd {
 #[derive(Clone)]
 pub struct Replicator {
     tx: mpsc::UnboundedSender<Cmd>,
+    dk: [u8; 32],
     next_waiter: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -199,6 +204,7 @@ impl Replicator {
         tokio::spawn(actor.run(rx, core.inner.store.closed()));
         Self {
             tx,
+            dk: *core.discovery_key(),
             next_waiter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
@@ -222,7 +228,8 @@ impl Replicator {
     /// Replicates this core over `mux` (one call per connection). `pairing`
     /// is the remote open that asked for this core, answered by the attach.
     pub fn attach(&self, mux: &Mux, pairing: Option<PairRequest>) {
-        self.send(Cmd::Attach(mux.clone(), pairing));
+        let requests = mux.pair(PROTOCOL, Some(&self.dk));
+        self.send(Cmd::Attach(mux.clone(), requests, pairing));
     }
 
     pub(crate) fn request_block(
@@ -681,8 +688,8 @@ impl Actor {
                 let waiters: usize = self.blocks.values().map(|b| b.waiters.len()).sum();
                 let _ = reply.send(waiters + self.seeks.len() + self.ranges.len());
             }
-            Cmd::Attach(mux, pairing) => {
-                self.attach(core, mux);
+            Cmd::Attach(mux, requests, pairing) => {
+                self.attach(core, mux, requests);
                 drop(pairing);
             }
             Cmd::MakePeer(mux, req) => {
@@ -777,9 +784,12 @@ impl Actor {
 
     // Connections
 
-    fn attach(&mut self, core: &Core, mux: Mux) {
-        let dk = *core.discovery_key();
-        let mut requests = mux.pair(PROTOCOL, Some(&dk));
+    fn attach(
+        &mut self,
+        core: &Core,
+        mux: Mux,
+        mut requests: mpsc::UnboundedReceiver<PairRequest>,
+    ) {
         let tx = self.tx.clone();
         let m = mux.clone();
         tokio::spawn(async move {

@@ -284,6 +284,57 @@ async fn replication_reports_download_and_raw_ciphertext() {
 }
 
 #[tokio::test]
+async fn replication_pairs_synchronously_before_mux_ready() {
+    use compact_encoding::{encode, hypercore::Handshake};
+    use protomux::{ChannelOptions, Event, Mux, StreamInfo, memory};
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let core = Core::open(
+        &store,
+        CoreOptions {
+            key_pair: Some(KeyPair::from_seed(&[19; 32])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let ((ar, aw), (br, bw)) = memory::duplex(64);
+    let info = |is_initiator| StreamInfo {
+        is_initiator,
+        handshake_hash: Some([7; 64]),
+        remote_public_key: None,
+    };
+    let remote = Mux::new(ar, aw, info(true));
+    let local = Mux::new(br, bw, info(false));
+    let mut barrier = local.pair("barrier", None);
+    let handshake = encode(&Handshake {
+        seeks: true,
+        capability: hypercore::crypto::replicate_capability(true, core.key(), &[7; 64]),
+    });
+    let mut options = ChannelOptions::new("hypercore/alpha");
+    options.id = Some(core.discovery_key());
+    options.handshake = &handshake;
+    let mut channel = remote.open_channel(options).unwrap();
+    let _barrier_channel = remote.open_channel(ChannelOptions::new("barrier")).unwrap();
+    // Ordered frames prove the core's open is already held before attach.
+    let _barrier_request = tokio::time::timeout(Duration::from_secs(5), barrier.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    core.replicate(&local);
+    local.ready();
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), channel.recv())
+            .await
+            .unwrap(),
+        Some(Event::Opened { .. })
+    ));
+    local.destroy();
+    remote.destroy();
+}
+
+#[tokio::test]
 async fn storage_close_stops_actors_and_invalidates_handles() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
