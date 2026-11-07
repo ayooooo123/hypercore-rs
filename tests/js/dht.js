@@ -83,7 +83,7 @@ async function read() {
   const elapsed = (Date.now() - started) / 1000
   const used = process.cpuUsage(cpu)
   const mib = core.byteLength / 1048576
-  log(`PERF js->js ${mib / elapsed} MiB/s ${(used.user + used.system) / 1e6 * 1024 / mib} reader CPU-s/GiB`)
+  log(`PERF js-reader ${mib / elapsed} MiB/s ${(used.user + used.system) / 1e6 * 1024 / mib} reader CPU-s/GiB`)
   const hash = crypto.createHash('sha256')
   for (let i = 0; i < core.length; i++) hash.update(await core.get(i))
   log('sha256 ' + hash.digest('hex') + ' ' + core.length + ' ' + (Date.now() - started))
