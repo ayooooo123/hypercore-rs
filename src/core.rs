@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use compact_encoding::hypercore::{Data, Manifest};
-use compact_encoding::{Bytes, Codec, Reader, Writer};
+use compact_encoding::hypercore::{Data, Manifest, Node};
+use compact_encoding::Bytes;
 use tokio::sync::{broadcast, watch};
 
 use crate::bitfield::Bitfield;
@@ -409,7 +409,10 @@ fn bitfield_pages(
     batch: &mut storage::Batch,
 ) {
     for (page, bytes) in bitfield.preview_range(start, end, value) {
-        batch.put_bitfield_page(page, bytes.map(Bytes::from));
+        match bytes {
+            Some(bytes) => batch.put_bitfield_page(page, Bytes::from(bytes)),
+            None => batch.delete_bitfield_page(page),
+        }
     }
 }
 
@@ -497,7 +500,7 @@ impl Core {
                     key,
                     manifest: manifest.clone(),
                     secret_key: opts.key_pair.as_ref().map(|kp| kp.secret_key),
-                    encryption_key: opts.encryption_key.map(Bytes::copy_from_slice),
+                    encryption_key: opts.encryption_key.map(|key| Bytes::copy_from_slice(&key)),
                     ..Default::default()
                 };
                 let storage = store.create_core(storage::CreateCore {
@@ -642,13 +645,13 @@ impl Core {
 
     pub fn user_data(&self, key: &str) -> Result<Option<Bytes>> {
         self.ensure_open()?;
-        Ok(self.inner.storage.user_data(key)?)
+        Ok(self.inner.storage.get_user_data(key)?)
     }
 
     pub async fn set_user_data(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
         let _w = self.inner.write.lock().await;
         self.ensure_open()?;
-        if self.inner.storage.user_data(key)?.as_deref() == value {
+        if self.inner.storage.get_user_data(key)?.as_deref() == value {
             return Ok(());
         }
         let mut batch = self.inner.storage.write();
@@ -1387,12 +1390,12 @@ impl Core {
             for (page, words) in pages {
                 sb.put_bitfield_page(
                     page,
-                    Some(Bytes::from(
+                    Bytes::from(
                         words
                             .iter()
                             .flat_map(|w| w.to_le_bytes())
                             .collect::<Vec<u8>>(),
-                    )),
+                    ),
                 );
             }
             let mut c = st.header.contiguous_length;

@@ -78,7 +78,7 @@ const CORES: &[(&str, bool)] = &[
 ];
 
 /// Opens every core from the ledger and compares it.
-async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Core)> {
+async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Session)> {
     let mut out = Vec::new();
     for (name, _) in CORES {
         let entry = &ledger["cores"][*name];
@@ -91,7 +91,11 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Co
         if *name == "secret" {
             options.encryption_key = Some(hex_to_key(ledger["encryptionKey"].as_str().unwrap()));
         }
-        let session = store
+        let view = match entry["namespace"].as_str() {
+            Some(namespace) => store.namespace(namespace),
+            None => store.clone(),
+        };
+        let session = view
             .get(options)
             .await
             .unwrap_or_else(|e| panic!("{name}: get: {e}"));
@@ -130,7 +134,7 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Co
                 .unwrap_or_else(|| panic!("{name}: block {index} missing"));
             assert_eq!(hex(&value), sample["value"].as_str().unwrap(), "{name}: block {index}");
         }
-        out.push((name.to_string(), core.clone()));
+        out.push((name.to_string(), session));
     }
     out
 }
@@ -140,10 +144,16 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Co
 async fn rust_turn(dir: &Path) -> usize {
     let mut ledger = read_ledger(dir);
     let store = Corestore::open(dir).expect("open store");
+    assert_eq!(
+        hex(store.primary_key()),
+        ledger["primaryKey"].as_str().unwrap(),
+        "primary key from the store head seed"
+    );
     let cores = verify(&store, &ledger).await;
 
     let tag = Bytes::from(vec![0x32u8; 32]);
-    for (name, core) in &cores {
+    for (name, session) in &cores {
+        let core = session.core();
         let appendable = CORES
             .iter()
             .find(|(core_name, _)| core_name == name)
@@ -158,7 +168,7 @@ async fn rust_turn(dir: &Path) -> usize {
     let alpha = cores
         .iter()
         .find(|(name, _)| name == "alpha")
-        .map(|(_, core)| core)
+        .map(|(_, session)| session.core())
         .unwrap();
     alpha
         .set_user_data("last-writer", Some(b"rust"))
@@ -175,7 +185,8 @@ async fn rust_turn(dir: &Path) -> usize {
     ledger["beeEntries"] = json!(turn + 1);
 
     // Rewrite the ledger from the new state.
-    for (name, core) in &cores {
+    for (name, session) in &cores {
+        let core = session.core();
         let roots = hypercore::merkle::roots_at(core.storage(), core.length()).unwrap();
         let mut sample = Vec::new();
         for index in [0u64, core.length().saturating_sub(1)] {
@@ -199,6 +210,7 @@ async fn rust_turn(dir: &Path) -> usize {
             "sample": sample,
             "appendable": ledger["cores"][name]["appendable"],
             "sparse": ledger["cores"][name]["sparse"],
+            "namespace": ledger["cores"][name]["namespace"],
         });
     }
 
@@ -237,10 +249,16 @@ async fn js_and_rust_switch_on_one_directory() {
     let store = Corestore::open(&dir).expect("open");
     let ledger = read_ledger(&dir);
     let cores = verify(&store, &ledger).await;
-    let alpha = cores.iter().find(|(name, _)| name == "alpha").unwrap().1.clone();
+    let alpha = cores
+        .iter()
+        .find(|(name, _)| name == "alpha")
+        .unwrap()
+        .1
+        .core()
+        .clone();
     assert_eq!(
         alpha.user_data("last-writer").unwrap().as_deref(),
-        Some(&b"rust"[..]),
+        Some(&b"js"[..]),
         "user data survives alternating writers"
     );
     let bee = Bee::open(&store, None).await.unwrap();

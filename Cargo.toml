@@ -23,6 +23,8 @@ salsa20 = "0.10"
 tokio = { version = "1.40", features = ["sync", "rt", "macros", "time"] }
 
 [dev-dependencies]
+corestore-rs = { path = "../corestore-rs" }
+hyperbee-rs = { path = "../hyperbee-rs" }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1.40", features = ["full"] }

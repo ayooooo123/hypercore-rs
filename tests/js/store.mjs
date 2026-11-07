@@ -164,7 +164,10 @@ async function build(dir) {
   for (const spec of CORES) {
     const core = spec.bee ? bee : opened[spec.name]
     const storage = spec.bee ? bee.core : core
-    ledger.cores[spec.name] = await describe(storage, spec, spec.bee ? { bee: true } : {})
+    ledger.cores[spec.name] = await describe(storage, spec, {
+      ...(spec.bee ? { bee: true } : {}),
+      ...(spec.namespace ? { namespace: spec.namespace } : {})
+    })
   }
   ledger.beeEntries = 4
   writeLedger(ledger)
@@ -233,7 +236,10 @@ async function switchDir(dir, writer) {
   for (const spec of CORES) {
     const core = spec.bee ? bee : opened[spec.name]
     const storage = spec.bee ? bee.core : core
-    ledger.cores[spec.name] = await describe(storage, spec, spec.bee ? { bee: true } : {})
+    ledger.cores[spec.name] = await describe(storage, spec, {
+      ...(spec.bee ? { bee: true } : {}),
+      ...(spec.namespace ? { namespace: spec.namespace } : {})
+    })
   }
   writeLedger(ledger)
   await closeAll(store, opened, bee)
