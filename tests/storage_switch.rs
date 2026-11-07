@@ -101,7 +101,11 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
             .unwrap_or_else(|e| panic!("{name}: get: {e}"));
         let core = session.core();
         assert_eq!(core.key(), &key, "{name}: key");
-        assert_eq!(core.length(), entry["length"].as_u64().unwrap(), "{name}: length");
+        assert_eq!(
+            core.length(),
+            entry["length"].as_u64().unwrap(),
+            "{name}: length"
+        );
         assert_eq!(core.fork(), entry["fork"].as_u64().unwrap(), "{name}: fork");
         assert_eq!(
             core.contiguous_length(),
@@ -115,11 +119,7 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
             entry["rootHash"].as_str().unwrap(),
             "{name}: root hash"
         );
-        let stored = core
-            .storage()
-            .get_head()
-            .unwrap()
-            .unwrap_or_default();
+        let stored = core.storage().get_head().unwrap().unwrap_or_default();
         assert_eq!(
             stored.signature.as_ref().map(|s| hex(s)),
             entry["signature"].as_str().map(str::to_string),
@@ -132,7 +132,11 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
                 .await
                 .unwrap_or_else(|e| panic!("{name}: block {index}: {e}"))
                 .unwrap_or_else(|| panic!("{name}: block {index} missing"));
-            assert_eq!(hex(&value), sample["value"].as_str().unwrap(), "{name}: block {index}");
+            assert_eq!(
+                hex(&value),
+                sample["value"].as_str().unwrap(),
+                "{name}: block {index}"
+            );
         }
         out.push((name.to_string(), session));
     }
@@ -161,7 +165,7 @@ async fn rust_turn(dir: &Path) -> usize {
         if !appendable || name == "bee" {
             continue;
         }
-        core.append(&[tag.clone()])
+        core.append(std::slice::from_ref(&tag))
             .await
             .unwrap_or_else(|e| panic!("{name}: append: {e}"));
     }
@@ -191,7 +195,11 @@ async fn rust_turn(dir: &Path) -> usize {
         let mut sample = Vec::new();
         for index in [0u64, core.length().saturating_sub(1)] {
             if index < core.length() && core.has(index) {
-                let value = core.get(index, ReadOptions::default()).await.unwrap().unwrap();
+                let value = core
+                    .get(index, ReadOptions::default())
+                    .await
+                    .unwrap()
+                    .unwrap();
                 sample.push(json!({ "index": index, "value": hex(&value) }));
             }
         }
