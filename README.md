@@ -39,7 +39,7 @@ let block = reader.get(1, GetOptions::default()).await?;
 - `core`: append, get (local or from peers, with timeouts), update, download ranges, seek,
   truncate, clear, purge, and sessions. Inactive sessions do not keep downloads active; closing the
   last session shuts down its physical core once any detached exclusive lease is released.
-- `storage`: npm `hypercore-storage`'s RockDB layout, read and written by
+- `storage`: npm `hypercore-storage`'s RocksDB layout, read and written by
   [`hypercore-storage-rs`](../hypercore-storage-rs): one `corestore` column family holds the store
   head, the discovery-key index, aliases, groups, and per core the auth row, head, hints, every
   block, tree node, bitfield page and user-data entry. A directory written by corestore 7.16.1 on
@@ -66,6 +66,11 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
   reads, with SHA-256 of every byte compared. The size is `HC_INTEROP_MB` (default 32); the 1 GiB
   run is `HC_INTEROP_MB=1024 cargo test --release --test replicate_dht -- --include-ignored --test-threads 1`.
   It needs the peeroxide fork next to this repo (`../peeroxide`, patched in `Cargo.toml`).
+- `tests/storage_switch.rs` (needs `npm install` in `tests/js`): npm corestore 7.16.1 writes a
+  store with ten cores, then JS and Rust take turns opening that same directory, appending, writing
+  user data, and comparing every core's length, tree and blocks. `tests/storage_crash.rs` kills a
+  writer mid-append and checks the directory still opens on both sides. Neither stack has a private
+  format: the directory is the interchange format.
 - `tests/replicate_js.rs`: the same over secret-stream on TCP, plus an encrypted JS core and a JS
   truncation (reorg). A fast regression check that doesn't involve the DHT.
 - `cargo run --release --example crypto_bench` measures the per-block crypto. On an Apple M-series
