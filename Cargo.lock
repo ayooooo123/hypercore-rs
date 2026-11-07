@@ -511,6 +511,7 @@ dependencies = [
 name = "libudx"
 version = "1.7.4"
 dependencies = [
+ "rand 0.9.5",
  "thiserror",
  "tokio",
  "tracing",
