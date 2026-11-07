@@ -165,6 +165,29 @@ impl<H: Eq + Hash + Copy> LocalWants<H> {
         freed
     }
 
+    pub fn clear(&mut self) -> Vec<Want> {
+        let mut wants: Vec<Want> = self
+            .wants
+            .drain()
+            .map(|(batch, _)| Want {
+                start: batch * WANT_BATCH,
+                length: WANT_BATCH,
+                any: false,
+            })
+            .collect();
+        wants.extend(self.free.drain(..).map(|batch| Want {
+            start: batch * WANT_BATCH,
+            length: WANT_BATCH,
+            any: false,
+        }));
+        wants.extend(self.any.drain(..).map(|want| Want {
+            start: want.start,
+            length: want.length,
+            any: false,
+        }));
+        wants
+    }
+
     pub fn destroy(&mut self) {
         self.destroyed = true;
         self.wants.clear();

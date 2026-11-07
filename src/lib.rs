@@ -14,4 +14,4 @@ pub mod verifier;
 mod wants;
 
 pub use compact_encoding::hypercore::{Manifest, Node};
-pub use core::{Core, CoreError, CoreOptions, GetOptions, Head, Session};
+pub use core::{AppendOptions, Core, CoreError, CoreEvent, CoreOptions, GetOptions, Head, Session};

@@ -37,12 +37,14 @@ let block = reader.get(1, GetOptions::default()).await?;
   re-requests a block once it has been in flight three times that peer's block round trip; an idle
   peer takes any.
 - `core`: append, get (local or from peers, with timeouts), update, download ranges, seek,
-  truncate, clear, purge, and sessions. Sessions opened with `active: false` don't keep the core
-  downloading; once no active session remains the replicator lingers 20–40 s (as JS does) and lets
-  idle channels close.
+  truncate, clear, purge, and sessions. Inactive sessions do not keep downloads active; the last
+  active session detaches the downloader and releases its wants.
 - `storage`: private to each peer. One redb database per directory holds headers, tree nodes,
   bitfield pages and small blocks; blocks of 16 KiB or more go to append-only segment files (128
   blocks per file), deleted once every block in them is cleared.
+- `Core::events` exposes append, replicated download, truncation, peer and close notifications;
+  `subscribe` remains available for head changes. User metadata is persisted with `set_user_data`,
+  and `GetOptions::raw` returns stored ciphertext without decrypting.
 
 Not ported: push mode, repair mode, protocol extensions, block-list ranges, sessions on named
 branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window of 48 is used).

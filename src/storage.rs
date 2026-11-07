@@ -42,6 +42,8 @@ pub enum StorageError {
     Io(io::Error),
     Db(String),
     Corrupt(String),
+    Closed,
+    ReadOnly,
 }
 
 impl fmt::Display for StorageError {
@@ -50,6 +52,8 @@ impl fmt::Display for StorageError {
             StorageError::Io(e) => write!(f, "io: {e}"),
             StorageError::Db(e) => write!(f, "database: {e}"),
             StorageError::Corrupt(e) => write!(f, "corrupt storage: {e}"),
+            StorageError::Closed => f.write_str("storage closed"),
+            StorageError::ReadOnly => f.write_str("storage is read-only"),
         }
     }
 }
@@ -84,7 +88,9 @@ pub struct Store {
 }
 
 struct StoreInner {
-    db: Database,
+    db: RwLock<Option<Database>>,
+    read_only: bool,
+    closed: tokio::sync::watch::Sender<bool>,
     dir: PathBuf,
     handles: Mutex<HandleCache>,
     // Writers hold this across commit and the unlinks that follow it: releasing the redb
@@ -113,12 +119,60 @@ impl Store {
         txn.commit().map_err(db_err)?;
         Ok(Store {
             inner: Arc::new(StoreInner {
-                db,
+                db: RwLock::new(Some(db)),
+                read_only: false,
+                closed: tokio::sync::watch::channel(false).0,
                 dir: dir.to_path_buf(),
                 handles: Mutex::new(HandleCache::default()),
                 gate: RwLock::new(()),
             }),
         })
+    }
+
+    pub fn open_read_only(dir: &Path) -> Result<Store> {
+        let db = Database::open(dir.join("db.redb")).map_err(db_err)?;
+        Ok(Store {
+            inner: Arc::new(StoreInner {
+                db: RwLock::new(Some(db)),
+                read_only: true,
+                closed: tokio::sync::watch::channel(false).0,
+                dir: dir.to_path_buf(),
+                handles: Mutex::new(HandleCache::default()),
+                gate: RwLock::new(()),
+            }),
+        })
+    }
+
+    pub fn read_only(&self) -> bool {
+        self.inner.read_only
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+    }
+
+    pub(crate) fn closed(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.closed.subscribe()
+    }
+
+    pub fn close(&self) {
+        self.inner.closed.send_replace(true);
+        let _gate = self.inner.gate.write().unwrap_or_else(|p| p.into_inner());
+        self.inner
+            .handles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .files
+            .clear();
+        self.inner
+            .db
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
     }
 
     /// Handle for one core; writes nothing until a [`Batch`] is committed.
@@ -131,7 +185,12 @@ impl Store {
 
     /// Discovery keys of every core that has a header.
     pub fn cores(&self) -> Result<Vec<[u8; 32]>> {
-        let txn = self.inner.db.begin_read().map_err(db_err)?;
+        let db = self.inner.db.read().unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(HEADERS).map_err(db_err)?;
         let mut out = Vec::new();
         for entry in table.iter().map_err(db_err)? {
@@ -149,8 +208,19 @@ impl Store {
 
     /// Remove every record and segment file belonging to one core.
     pub fn delete_core(&self, discovery_key: &[u8; 32]) -> Result<()> {
+        if self.is_closed() {
+            return Err(StorageError::Closed);
+        }
+        if self.inner.read_only {
+            return Err(StorageError::ReadOnly);
+        }
         let _gate = self.inner.gate.write().unwrap_or_else(|p| p.into_inner());
-        let txn = self.inner.db.begin_write().map_err(db_err)?;
+        let db = self.inner.db.read().unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_write()
+            .map_err(db_err)?;
         {
             let mut headers = txn.open_table(HEADERS).map_err(db_err)?;
             headers.remove(&discovery_key[..]).map_err(db_err)?;
@@ -173,7 +243,12 @@ impl Store {
 
     /// Store-level metadata, e.g. the corestore primary key.
     pub fn get_meta(&self, key: &str) -> Result<Option<Bytes>> {
-        let txn = self.inner.db.begin_read().map_err(db_err)?;
+        let db = self.inner.db.read().unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(META).map_err(db_err)?;
         let value = table.get(key.as_bytes()).map_err(db_err)?;
         Ok(value.map(|v| Bytes::copy_from_slice(v.value())))
@@ -181,7 +256,18 @@ impl Store {
 
     /// Store-level metadata; `None` deletes the key.
     pub fn put_meta(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
-        let txn = self.inner.db.begin_write().map_err(db_err)?;
+        if self.is_closed() {
+            return Err(StorageError::Closed);
+        }
+        if self.inner.read_only {
+            return Err(StorageError::ReadOnly);
+        }
+        let db = self.inner.db.read().unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_write()
+            .map_err(db_err)?;
         {
             let mut table = txn.open_table(META).map_err(db_err)?;
             match value {
@@ -264,7 +350,17 @@ impl CoreStorage {
 
     /// Opaque core header (the signed manifest) if it was stored.
     pub fn header(&self) -> Result<Option<Bytes>> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(HEADERS).map_err(db_err)?;
         let value = table.get(&self.dk[..]).map_err(db_err)?;
         Ok(value.map(|v| Bytes::copy_from_slice(v.value())))
@@ -272,7 +368,17 @@ impl CoreStorage {
 
     /// Merkle tree node at `index`.
     pub fn tree_node(&self, index: u64) -> Result<Option<Node>> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(NODES).map_err(db_err)?;
         let value = table.get(&core_key(&self.dk, index)[..]).map_err(db_err)?;
         match value {
@@ -283,7 +389,17 @@ impl CoreStorage {
 
     /// Whether a merkle tree node exists at `index`.
     pub fn has_tree_node(&self, index: u64) -> Result<bool> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(NODES).map_err(db_err)?;
         Ok(table
             .get(&core_key(&self.dk, index)[..])
@@ -300,7 +416,17 @@ impl CoreStorage {
             .gate
             .read()
             .unwrap_or_else(|p| p.into_inner());
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(BLOCKS).map_err(db_err)?;
         let value = table.get(&core_key(&self.dk, index)[..]).map_err(db_err)?;
         let raw = match value {
@@ -331,7 +457,17 @@ impl CoreStorage {
 
     /// Every stored bitfield page, ascending.
     pub fn bitfield_pages(&self) -> Result<Vec<(u64, Bytes)>> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(BITFIELD).map_err(db_err)?;
         let mut out = Vec::new();
         for (key, value) in prefix_entries(&table, &self.dk)? {
@@ -343,7 +479,17 @@ impl CoreStorage {
 
     /// One user-data value.
     pub fn user_data(&self, key: &str) -> Result<Option<Bytes>> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(USER).map_err(db_err)?;
         let value = table.get(&user_key(&self.dk, key)[..]).map_err(db_err)?;
         Ok(value.map(|v| Bytes::copy_from_slice(v.value())))
@@ -351,7 +497,17 @@ impl CoreStorage {
 
     /// All user-data values, by key.
     pub fn user_data_all(&self) -> Result<Vec<(String, Bytes)>> {
-        let txn = self.store.inner.db.begin_read().map_err(db_err)?;
+        let db = self
+            .store
+            .inner
+            .db
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_read()
+            .map_err(db_err)?;
         let table = txn.open_table(USER).map_err(db_err)?;
         let mut out = Vec::new();
         for (key, value) in prefix_entries(&table, &self.dk)? {
@@ -367,6 +523,12 @@ impl CoreStorage {
 
     /// Apply a batch atomically and durably.
     pub fn write(&self, batch: Batch) -> Result<()> {
+        if self.store.is_closed() {
+            return Err(StorageError::Closed);
+        }
+        if self.store.inner.read_only {
+            return Err(StorageError::ReadOnly);
+        }
         if batch.is_empty() {
             return Ok(());
         }
@@ -378,7 +540,12 @@ impl CoreStorage {
             .unwrap_or_else(|p| p.into_inner());
         let inner = &*self.store.inner;
         let dk = &self.dk;
-        let mut txn = inner.db.begin_write().map_err(db_err)?;
+        let db = inner.db.read().unwrap_or_else(|p| p.into_inner());
+        let mut txn = db
+            .as_ref()
+            .ok_or(StorageError::Closed)?
+            .begin_write()
+            .map_err(db_err)?;
         txn.set_durability(Durability::Immediate).map_err(db_err)?;
 
         // Declared outside the table scope: segment bytes are synced before the commit.
@@ -856,7 +1023,8 @@ mod tests {
     }
 
     fn segment_record(store: &Store, key: &[u8; 32], segment: u64) -> Option<(u64, u64)> {
-        let txn = store.inner.db.begin_read().unwrap();
+        let db = store.inner.db.read().unwrap();
+        let txn = db.as_ref().unwrap().begin_read().unwrap();
         let table = txn.open_table(SEGMENTS).unwrap();
         let value = table.get(&core_key(key, segment)[..]).unwrap()?;
         let stat = decode_seg_record(value.value()).unwrap();
@@ -864,7 +1032,8 @@ mod tests {
     }
 
     fn raw_block(store: &Store, key: &[u8; 32], index: u64) -> Option<Vec<u8>> {
-        let txn = store.inner.db.begin_read().unwrap();
+        let db = store.inner.db.read().unwrap();
+        let txn = db.as_ref().unwrap().begin_read().unwrap();
         let table = txn.open_table(BLOCKS).unwrap();
         let value = table.get(&core_key(key, index)[..]).unwrap()?;
         Some(value.value().to_vec())
@@ -1144,7 +1313,8 @@ mod tests {
             }
         }
 
-        let txn = store.inner.db.begin_read().unwrap();
+        let db = store.inner.db.read().unwrap();
+        let txn = db.as_ref().unwrap().begin_read().unwrap();
         let blocks = txn.open_table(BLOCKS).unwrap();
         let mut live: HashMap<u64, u64> = HashMap::new();
         assert_eq!(prefix_entries(&blocks, &key).unwrap().len(), model.len());

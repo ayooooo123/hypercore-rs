@@ -74,7 +74,9 @@ async function read() {
   await core.ready()
   const ss = new SecretStream(true, net.connect(Number(port), '127.0.0.1'))
   ss.on('error', () => {})
+  const peer = new Promise(resolve => core.once('peer-add', resolve))
   core.replicate(ss)
+  await peer
   await core.update({ wait: true })
   const started = Date.now()
   await core.download({ start: 0, end: core.length }).done()

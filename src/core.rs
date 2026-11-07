@@ -2,13 +2,13 @@
 //! the local operations on them. Replication drives `verify_*` and `reorg`.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use compact_encoding::hypercore::{Data, Manifest};
 use compact_encoding::{Bytes, Codec, Reader, Writer};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::bitfield::Bitfield;
 use crate::crypto::{self, KeyPair};
@@ -61,7 +61,10 @@ impl std::error::Error for CoreError {}
 
 impl From<StorageError> for CoreError {
     fn from(e: StorageError) -> Self {
-        Self::Storage(e)
+        match e {
+            StorageError::Closed => Self::Closed,
+            other => Self::Storage(other),
+        }
     }
 }
 
@@ -86,15 +89,48 @@ impl NodeStore for CoreStorage {
 }
 
 /// How to open (or create) a core.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct CoreOptions {
     pub key: Option<[u8; 32]>,
     pub key_pair: Option<KeyPair>,
     pub manifest: Option<Manifest>,
     pub encryption_key: Option<[u8; 32]>,
     pub encryption: EncryptionOptions,
+    pub manifest_version: u64,
+    pub inflight_range: Option<(u32, u32)>,
     /// Fail with `NotFound` instead of creating the core.
     pub no_create: bool,
+}
+
+impl Default for CoreOptions {
+    fn default() -> Self {
+        Self {
+            key: None,
+            key_pair: None,
+            manifest: None,
+            encryption_key: None,
+            encryption: EncryptionOptions::default(),
+            manifest_version: 1,
+            inflight_range: None,
+            no_create: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreEvent {
+    Append { start: u64, length: u64 },
+    Download { index: u64, byte_length: u64 },
+    Truncate { fork: u64, length: u64 },
+    PeerAdd,
+    PeerRemove,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppendOptions {
+    pub writable: bool,
+    pub max_length: Option<u64>,
 }
 
 /// Length, fork and byte length at one moment.
@@ -309,9 +345,13 @@ pub(crate) struct Inner {
     state: Mutex<State>,
     write: tokio::sync::Mutex<()>,
     head: watch::Sender<Head>,
+    events: broadcast::Sender<CoreEvent>,
+    closed: AtomicBool,
+    pub(crate) inflight_range: Option<(u32, u32)>,
     pub replicator: OnceLock<Replicator>,
     sessions: AtomicUsize,
     active_sessions: AtomicUsize,
+    manually_active: AtomicBool,
     peers: AtomicUsize,
     idle_hook: OnceLock<IdleHook>,
 }
@@ -332,9 +372,11 @@ impl Core {
     /// Opens (or creates) the core described by `opts` in `store`.
     pub fn open(store: &Store, opts: CoreOptions) -> Result<Core> {
         let manifest = opts.manifest.clone().or_else(|| {
-            opts.key_pair
-                .as_ref()
-                .map(|kp| verifier::default_signer_manifest(kp.public_key))
+            opts.key_pair.as_ref().map(|kp| {
+                let mut manifest = verifier::default_signer_manifest(kp.public_key);
+                manifest.version = opts.manifest_version;
+                manifest
+            })
         });
         let key = match (opts.key, &manifest) {
             (Some(k), _) => k,
@@ -434,9 +476,13 @@ impl Core {
                 state: Mutex::new(state),
                 write: tokio::sync::Mutex::new(()),
                 head: watch::channel(head).0,
+                events: broadcast::channel(256).0,
+                closed: AtomicBool::new(false),
+                inflight_range: opts.inflight_range,
                 replicator: OnceLock::new(),
                 sessions: AtomicUsize::new(0),
                 active_sessions: AtomicUsize::new(0),
+                manually_active: AtomicBool::new(false),
                 peers: AtomicUsize::new(0),
                 idle_hook: OnceLock::new(),
             }),
@@ -446,6 +492,20 @@ impl Core {
 
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn stored_head(store: &Store, discovery_key: &[u8; 32]) -> Result<Option<Head>> {
+        let storage = store.core(discovery_key);
+        let Some(bytes) = storage.header()? else {
+            return Ok(None);
+        };
+        let header = Header::decode(bytes)?;
+        let roots = merkle::roots_at(&storage, header.length)?;
+        Ok(Some(Head {
+            fork: header.fork,
+            length: header.length,
+            byte_length: merkle::total_size(&roots),
+        }))
     }
 
     pub fn key(&self) -> &[u8; 32] {
@@ -477,9 +537,43 @@ impl Core {
         st.header.contiguous_length.min(st.tree.length)
     }
 
+    pub fn remote_contiguous_length(&self) -> u64 {
+        let st = self.state();
+        st.header.remote_contiguous_length.min(st.tree.length)
+    }
+
+    pub fn user_data(&self, key: &str) -> Result<Option<Bytes>> {
+        self.ensure_open()?;
+        Ok(self.inner.storage.user_data(key)?)
+    }
+
+    pub async fn set_user_data(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
+        let _w = self.inner.write.lock().await;
+        self.ensure_open()?;
+        if self.inner.storage.user_data(key)?.as_deref() == value {
+            return Ok(());
+        }
+        let mut batch = storage::Batch::default();
+        batch.put_user_data(key, value.map(Bytes::copy_from_slice));
+        let storage = self.inner.storage.clone();
+        blocking(move || storage.write(batch)).await?;
+        Ok(())
+    }
+
+    pub async fn tree_hash(&self, length: u64) -> Result<[u8; 32]> {
+        self.ensure_open()?;
+        if length > 0 && !self.has(length - 1) {
+            self.get(length - 1, GetOptions::default()).await?;
+        }
+        Ok(crypto::tree_hash(&merkle::roots_at(
+            &self.inner.storage,
+            length,
+        )?))
+    }
+
     pub fn writable(&self) -> bool {
         let st = self.state();
-        st.header.secret_key.is_some() && st.verifier.is_some()
+        !self.inner.store.read_only() && st.header.secret_key.is_some() && st.verifier.is_some()
     }
 
     pub fn manifest(&self) -> Option<Manifest> {
@@ -505,6 +599,18 @@ impl Core {
         self.inner.head.subscribe()
     }
 
+    pub fn events(&self) -> broadcast::Receiver<CoreEvent> {
+        self.inner.events.subscribe()
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.inner.closed.load(Ordering::Acquire) || self.inner.store.is_closed() {
+            Err(CoreError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Replicates this core over a Protomux connection (one call per connection).
     pub fn replicate(&self, mux: &protomux::Mux) {
         self.replicator().attach(mux, None);
@@ -518,6 +624,10 @@ impl Core {
 
     /// Stops replicating: closes every channel of this core.
     pub fn close(&self) {
+        if self.inner.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let _ = self.inner.events.send(CoreEvent::Close);
         if let Some(r) = self.inner.replicator.get() {
             r.destroy();
         }
@@ -553,6 +663,7 @@ impl Core {
 
     /// The raw stored block (still encrypted, if the core is).
     pub fn get_raw_local(&self, index: u64) -> Result<Option<Bytes>> {
+        self.ensure_open()?;
         if !self.has(index) {
             return Ok(None);
         }
@@ -566,7 +677,12 @@ impl Core {
 
     /// A block, downloading it from peers if `wait` (the default).
     pub async fn get(&self, index: u64, opts: GetOptions) -> Result<Option<Bytes>> {
-        if let Some(b) = self.get_local(index)? {
+        let local = if opts.raw {
+            self.get_raw_local(index)?
+        } else {
+            self.get_local(index)?
+        };
+        if let Some(b) = local {
             return Ok(Some(b));
         }
         if !opts.wait {
@@ -579,7 +695,11 @@ impl Core {
                 .map_err(|_| CoreError::Timeout)??,
             None => req.await?,
         };
-        Ok(Some(self.decrypt(index, raw)))
+        Ok(Some(if opts.raw {
+            raw
+        } else {
+            self.decrypt(index, raw)
+        }))
     }
 
     /// Asks peers for a longer signed length. True if the core grew.
@@ -636,15 +756,33 @@ impl Core {
 
     /// Appends blocks; returns the new head. The core must be writable.
     pub async fn append<B: AsRef<[u8]>>(&self, blocks: &[B]) -> Result<Head> {
+        self.append_with(blocks, AppendOptions::default()).await
+    }
+
+    pub async fn append_with<B: AsRef<[u8]>>(
+        &self,
+        blocks: &[B],
+        opts: AppendOptions,
+    ) -> Result<Head> {
         let _w = self.inner.write.lock().await;
+        self.ensure_open()?;
         let (batch, sb, start, end, contig) = {
             let st = self.state();
-            let kp = st.header.key_pair().ok_or(CoreError::NotWritable)?;
+            let kp = st.header.key_pair();
             let verifier = st.verifier.as_ref().ok_or(CoreError::NotWritable)?;
             if st.header.frozen {
                 return Err(CoreError::NotWritable);
             }
+            if kp.is_none() && !(opts.writable && verifier.quorum == 0) {
+                return Err(CoreError::NotWritable);
+            }
             let start = st.tree.length;
+            if opts
+                .max_length
+                .is_some_and(|max| start.saturating_add(blocks.len() as u64) > max)
+            {
+                return Ok(st.head());
+            }
             let mut batch = Batch::new(&st.tree);
             let mut sb = storage::Batch::default();
             for (i, b) in blocks.iter().enumerate() {
@@ -661,7 +799,20 @@ impl Core {
                 batch.append(&data);
                 sb.put_block(index, Bytes::from(data));
             }
-            batch.signature = Some(verifier.sign(&batch, &kp).ok_or(CoreError::NotWritable)?);
+            batch.signature = if let Some(kp) = kp {
+                Some(verifier.sign(&batch, &kp).ok_or(CoreError::NotWritable)?)
+            } else {
+                if verifier
+                    .prologue
+                    .as_ref()
+                    .is_some_and(|p| batch.length < p.length)
+                {
+                    return Err(CoreError::BadArgument(
+                        "Append is not consistent with prologue".into(),
+                    ));
+                }
+                None
+            };
             let end = batch.length;
             write_tree_ops(&mut batch, &mut sb);
             bitfield_pages(&st.bitfield, start, end, true, &mut sb);
@@ -687,6 +838,10 @@ impl Core {
             self.publish(&st);
             st.head()
         };
+        let _ = self.inner.events.send(CoreEvent::Append {
+            start,
+            length: end - start,
+        });
         if let Some(r) = self.inner.replicator.get() {
             r.on_append(start, end - start);
         }
@@ -768,6 +923,10 @@ impl Core {
             st.set_bits(start, old_length.max(start), false);
             self.publish(&st);
         }
+        let _ = self.inner.events.send(CoreEvent::Truncate {
+            fork: batch.fork,
+            length: batch.length,
+        });
         if let Some(r) = self.inner.replicator.get() {
             r.on_truncate(start, old_length.saturating_sub(start));
         }
@@ -838,12 +997,21 @@ impl Core {
     }
 
     // Sessions
+    pub fn set_active(&self, active: bool) {
+        self.inner.manually_active.store(active, Ordering::Release);
+        self.replicator().sync_active();
+    }
+
+    pub(crate) fn effective_active(&self) -> bool {
+        self.inner.manually_active.load(Ordering::Acquire) || self.active_session_count() > 0
+    }
 
     /// Opens a session; `active: false` sessions don't keep the core downloading.
     pub fn session(&self, active: bool) -> Session {
         self.inner.sessions.fetch_add(1, Ordering::AcqRel);
-        if active && self.inner.active_sessions.fetch_add(1, Ordering::AcqRel) == 0 {
-            self.replicator().set_active(true);
+        if active {
+            self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
+            self.replicator().sync_active();
         }
         Session {
             core: self.clone(),
@@ -881,7 +1049,15 @@ impl Core {
     }
 
     pub(crate) fn set_peer_count(&self, n: usize) {
-        self.inner.peers.store(n, Ordering::Release);
+        let old = self.inner.peers.swap(n, Ordering::AcqRel);
+        let event = if n > old {
+            CoreEvent::PeerAdd
+        } else {
+            CoreEvent::PeerRemove
+        };
+        for _ in 0..old.abs_diff(n) {
+            let _ = self.inner.events.send(event.clone());
+        }
     }
 
     pub(crate) fn check_if_idle(&self) {
@@ -991,6 +1167,12 @@ impl Core {
             }
             self.publish(&st);
         }
+        if let Some(block) = proof.block.as_ref() {
+            let _ = self.inner.events.send(CoreEvent::Download {
+                index: block.index,
+                byte_length: block.value.len() as u64,
+            });
+        }
         Ok(Some(upgraded))
     }
 
@@ -1070,6 +1252,16 @@ impl Core {
         st.header.contiguous_length = contig;
         for i in indices {
             st.set_bits(i, i + 1, true);
+        }
+        for (proof, result) in proofs.iter().zip(&results) {
+            if matches!(result, Ok(Some(_)))
+                && let Some(block) = &proof.block
+            {
+                let _ = self.inner.events.send(CoreEvent::Download {
+                    index: block.index,
+                    byte_length: block.value.len() as u64,
+                });
+            }
         }
         results
     }
@@ -1184,6 +1376,7 @@ pub struct GetOptions {
     pub timeout: Option<Duration>,
     /// Request even if the remote has not signalled it can upgrade us.
     pub force: bool,
+    pub raw: bool,
 }
 
 impl Default for GetOptions {
@@ -1192,6 +1385,7 @@ impl Default for GetOptions {
             wait: true,
             timeout: None,
             force: false,
+            raw: false,
         }
     }
 }
@@ -1211,6 +1405,25 @@ impl Session {
     pub fn is_active(&self) -> bool {
         self.active
     }
+
+    pub fn set_active(&mut self, active: bool) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active {
+            self.core
+                .inner
+                .active_sessions
+                .fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.core
+                .inner
+                .active_sessions
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+        self.core.replicator().sync_active();
+    }
 }
 
 impl std::ops::Deref for Session {
@@ -1224,12 +1437,36 @@ impl Drop for Session {
     fn drop(&mut self) {
         let inner = &self.core.inner;
         inner.sessions.fetch_sub(1, Ordering::AcqRel);
-        if self.active
-            && inner.active_sessions.fetch_sub(1, Ordering::AcqRel) == 1
-            && let Some(r) = inner.replicator.get()
-        {
-            r.set_active(false);
+        if self.active {
+            inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            if let Some(r) = inner.replicator.get() {
+                r.sync_active();
+            }
         }
         self.core.check_if_idle();
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn remote_contiguous_hint_is_capped_at_local_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let core = Core::open(
+            &store,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[21; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        core.append(&[b"a", b"b"]).await.unwrap();
+        core.set_remote_contiguous_length(10);
+        assert_eq!(core.remote_contiguous_length(), 2);
+        core.truncate(1, None).await.unwrap();
+        assert_eq!(core.remote_contiguous_length(), 1);
     }
 }

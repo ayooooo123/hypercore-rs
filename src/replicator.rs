@@ -137,8 +137,7 @@ enum Cmd {
         reply: oneshot::Sender<bool>,
     },
     Cancel(WaiterId),
-    Active(bool),
-    LingerDone(u64),
+    SyncActive,
     Appended {
         start: u64,
         length: u64,
@@ -196,7 +195,7 @@ impl Replicator {
             *core.discovery_key(),
             tx.clone(),
         );
-        tokio::spawn(actor.run(rx));
+        tokio::spawn(actor.run(rx, core.inner.store.closed()));
         Self {
             tx,
             next_waiter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -296,8 +295,8 @@ impl Replicator {
         rx.await.unwrap_or(0)
     }
 
-    pub(crate) fn set_active(&self, active: bool) {
-        self.send(Cmd::Active(active));
+    pub(crate) fn sync_active(&self) {
+        self.send(Cmd::SyncActive);
     }
 
     pub(crate) fn on_append(&self, start: u64, length: u64) {
@@ -464,6 +463,7 @@ struct Peer {
     mux: Mux,
     remote_supports_seeks: bool,
     inflight: usize,
+    inflight_range: (usize, usize),
     paused: bool,
     removed: bool,
     block_roundtrip: f64,
@@ -500,7 +500,9 @@ impl Peer {
     }
 
     fn max_inflight(&self) -> usize {
-        DEFAULT_MAX_INFLIGHT.1.min(DEFAULT_MAX_INFLIGHT.0 * 3)
+        self.inflight_range
+            .1
+            .min(self.inflight_range.0.saturating_mul(3))
     }
 
     fn max_hotswap_inflight(&self) -> usize {
@@ -541,18 +543,12 @@ struct Actor {
     next_id: u64,
     downloading: bool,
     active: bool,
-    linger: Option<u64>,
     had_peers: bool,
     if_available: i64,
     manifest_peer: Option<PeerId>,
     attached: Vec<Mux>,
     applying_reorg: bool,
     destroyed: bool,
-}
-
-/// JS picks the not-downloading linger at random in [20s, 40s).
-fn linger() -> Duration {
-    Duration::from_millis(rand::thread_rng().gen_range(20_000..40_000))
 }
 
 fn backoff(times: u64) -> Duration {
@@ -594,7 +590,6 @@ impl Actor {
             next_id: 1,
             downloading: false,
             active: false,
-            linger: None,
             had_peers: false,
             if_available: 0,
             manifest_peer: None,
@@ -608,14 +603,28 @@ impl Actor {
         self.core.upgrade().map(|inner| Core { inner })
     }
 
-    async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
+    async fn run(
+        mut self,
+        mut rx: mpsc::UnboundedReceiver<Cmd>,
+        mut closed: tokio::sync::watch::Receiver<bool>,
+    ) {
         let mut deferred = VecDeque::new();
         loop {
+            if *closed.borrow() {
+                if let Some(core) = self.core() {
+                    core.close();
+                }
+                break;
+            }
             let cmd = match deferred.pop_front() {
                 Some(c) => c,
-                None => match rx.recv().await {
-                    Some(c) => c,
-                    None => break,
+                None => tokio::select! {
+                    biased;
+                    _ = closed.changed() => continue,
+                    cmd = rx.recv() => match cmd {
+                        Some(c) => c,
+                        None => break,
+                    },
                 },
             };
             let Some(core) = self.core() else { break };
@@ -654,6 +663,10 @@ impl Actor {
         }
         for mux in &self.attached {
             mux.unpair(PROTOCOL, Some(&self.dk));
+        }
+        if let Some(core) = self.core() {
+            core.set_peer_count(0);
+            core.check_if_idle();
         }
     }
 
@@ -715,13 +728,7 @@ impl Actor {
                 self.update_all(core);
             }
             Cmd::Cancel(waiter) => self.cancel(core, waiter),
-            Cmd::Active(active) => self.set_active(core, active),
-            Cmd::LingerDone(generation) => {
-                if self.linger == Some(generation) {
-                    self.linger = None;
-                    self.set_downloading_now(core, false);
-                }
-            }
+            Cmd::SyncActive => self.set_active(core, core.effective_active()),
             Cmd::Appended { start, length } => {
                 self.on_upgrade(core);
                 self.on_have(core, start, length, false);
@@ -814,6 +821,12 @@ impl Actor {
             mux: mux.clone(),
             remote_supports_seeks: false,
             inflight: 0,
+            inflight_range: core
+                .inner
+                .inflight_range
+                .map_or(DEFAULT_MAX_INFLIGHT, |(min, max)| {
+                    (min as usize, max as usize)
+                }),
             paused: false,
             removed: false,
             block_roundtrip: 0.0,
@@ -1164,20 +1177,21 @@ impl Actor {
     }
 
     fn set_active(&mut self, core: &Core, active: bool) {
-        self.active = active;
-        self.linger = None;
-        if active {
-            self.set_downloading_now(core, true);
+        if self.active == active {
             return;
         }
-        // Lets a short gap between sessions keep connections warm, as JS does.
-        let generation = self.next_id();
-        self.linger = Some(generation);
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(linger()).await;
-            let _ = tx.send(Cmd::LingerDone(generation));
-        });
+        self.active = active;
+        if !active {
+            for peer in self.peers.iter_mut().flatten() {
+                for want in peer.wants.clear() {
+                    peer.send(MSG_UNWANT, &want);
+                }
+            }
+        }
+        self.set_downloading_now(core, active);
+        if active {
+            self.update_all(core);
+        }
     }
 
     fn set_downloading_now(&mut self, core: &Core, downloading: bool) {
