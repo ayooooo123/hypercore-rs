@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -165,7 +165,13 @@ enum Cmd {
 pub struct Replicator {
     tx: mpsc::UnboundedSender<Cmd>,
     dk: [u8; 32],
-    next_waiter: Arc<std::sync::atomic::AtomicU64>,
+    shared: Arc<Shared>,
+}
+
+struct Shared {
+    core: Weak<Inner>,
+    attaching: Mutex<()>,
+    next_waiter: std::sync::atomic::AtomicU64,
 }
 
 /// A pending download. Dropping it cancels the request.
@@ -205,7 +211,11 @@ impl Replicator {
         Self {
             tx,
             dk: *core.discovery_key(),
-            next_waiter: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            shared: Arc::new(Shared {
+                core: Arc::downgrade(&core.inner),
+                attaching: Mutex::new(()),
+                next_waiter: std::sync::atomic::AtomicU64::new(1),
+            }),
         }
     }
 
@@ -214,7 +224,8 @@ impl Replicator {
     }
 
     fn waiter(&self) -> WaiterId {
-        self.next_waiter
+        self.shared
+            .next_waiter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -228,6 +239,20 @@ impl Replicator {
     /// Replicates this core over `mux` (one call per connection). `pairing`
     /// is the remote open that asked for this core, answered by the attach.
     pub fn attach(&self, mux: &Mux, pairing: Option<PairRequest>) {
+        let _attaching = self
+            .shared
+            .attaching
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self
+            .shared
+            .core
+            .upgrade()
+            .is_none_or(|inner| (Core { inner }).is_closed())
+        {
+            self.send(Cmd::Destroy);
+            return;
+        }
         let requests = mux.pair(PROTOCOL, Some(&self.dk));
         self.send(Cmd::Attach(mux.clone(), requests, pairing));
     }
@@ -323,7 +348,16 @@ impl Replicator {
         self.send(Cmd::Cleared { start, length });
     }
 
+    pub(crate) async fn closed(&self) {
+        self.tx.closed().await;
+    }
+
     pub(crate) fn destroy(&self) {
+        let _attaching = self
+            .shared
+            .attaching
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         self.send(Cmd::Destroy);
     }
 }
@@ -640,6 +674,9 @@ impl Actor {
                 },
             };
             let Some(core) = self.core() else { break };
+            if core.is_closed() {
+                break;
+            }
             let cmd = match cmd {
                 Cmd::Wire {
                     peer,
@@ -3225,4 +3262,47 @@ fn is_plain_block(d: &Data, fork: u64) -> bool {
         && d.upgrade.is_none()
         && d.manifest.is_none()
         && d.fork == fork
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_replicator_cannot_replace_a_corestore_pairer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(dir.path()).unwrap();
+        let core = Core::open(
+            &store,
+            crate::CoreOptions {
+                key_pair: Some(crate::crypto::KeyPair::from_seed(&[19; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let replicator = core.replicator().clone();
+        let ((ar, aw), (br, bw)) = protomux::memory::duplex(16);
+        let a = Mux::new(ar, aw, protomux::StreamInfo::default());
+        let b = Mux::new(br, bw, protomux::StreamInfo::default());
+        let mut fallback = b.pair(PROTOCOL, None);
+        core.close();
+        // Models an attach that passed Core::replicate's check before close.
+        replicator.attach(&b, None);
+        tokio::time::timeout(Duration::from_secs(1), core.replication_closed())
+            .await
+            .unwrap();
+        let _remote = a
+            .open_channel(ChannelOptions {
+                id: Some(core.discovery_key()),
+                ..ChannelOptions::new(PROTOCOL)
+            })
+            .unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), fallback.recv())
+            .await
+            .expect("closed actor installed a stale specific pairer")
+            .unwrap();
+        drop(request);
+        a.destroy();
+        b.destroy();
+    }
 }

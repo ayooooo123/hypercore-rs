@@ -664,6 +664,11 @@ impl Core {
         &self.inner.discovery_key
     }
 
+    /// Whether both handles refer to the same physical core.
+    pub fn same_instance(&self, other: &Core) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn head(&self) -> Head {
         self.state().head()
     }
@@ -806,6 +811,13 @@ impl Core {
         let _ = self.inner.events.send(CoreEvent::Close);
         if let Some(r) = self.inner.replicator.get() {
             r.destroy();
+        }
+    }
+
+    /// Waits for an existing replication actor to release its channels after `close`.
+    pub async fn replication_closed(&self) {
+        if let Some(replicator) = self.inner.replicator.get() {
+            replicator.closed().await;
         }
     }
 

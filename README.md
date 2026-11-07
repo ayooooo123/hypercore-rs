@@ -39,6 +39,8 @@ let block = reader.get(1, GetOptions::default()).await?;
 - `core`: append, get (local or from peers, with timeouts), update, download ranges, seek,
   truncate, clear, purge, and sessions. Inactive sessions do not keep downloads active; closing the
   last session shuts down its physical core once any detached exclusive lease is released.
+  `replication_closed().await` waits for its actor to release channels and pairers;
+  `same_instance()` distinguishes physical generations of the same key.
 - `storage`: npm `hypercore-storage`'s RocksDB layout, read and written by
   [`hypercore-storage-rs`](../hypercore-storage-rs): one `corestore` column family holds the store
   head, the discovery-key index, aliases, groups, and per core the auth row, head, hints, every
