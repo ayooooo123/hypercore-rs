@@ -140,9 +140,13 @@ impl NodeStore for CoreStorage {
             .map_err(|e| MerkleError::Storage(e.to_string()))
     }
 
-    fn has_node(&self, index: u64) -> merkle::Result<bool> {
-        self.get_tree_node(index)
-            .map(|node| node.is_some())
+    fn nodes(&self, indices: &[u64]) -> merkle::Result<Vec<Option<Node>>> {
+        self.get_tree_nodes(indices)
+            .map_err(|e| MerkleError::Storage(e.to_string()))
+    }
+
+    fn missing_prefix(&self, indices: impl Iterator<Item = u64>) -> merkle::Result<u64> {
+        self.missing_tree_nodes(indices)
             .map_err(|e| MerkleError::Storage(e.to_string()))
     }
 }
@@ -1520,14 +1524,21 @@ impl Core {
         let mut sb = self.inner.storage.write();
         let contig = {
             let st = self.state();
+            let mut known = std::collections::HashMap::new();
             for proof in proofs {
                 let r = (|| {
                     if proof.fork != st.tree.fork {
                         return Ok(None);
                     }
-                    let mut batch = merkle::verify(&st.tree, &self.inner.storage, proof)?;
+                    let mut batch =
+                        merkle::verify_cached(&st.tree, &self.inner.storage, proof, &known)?;
                     if batch.upgraded || !batch.commitable(&st.tree) {
                         return Ok(None);
+                    }
+                    if proofs.len() > 1 {
+                        batch
+                            .nodes
+                            .retain(|node| known.insert(node.index, *node) != Some(*node));
                     }
                     write_tree_ops(&mut batch, &mut sb);
                     if let Some(b) = &proof.block {
@@ -2110,5 +2121,87 @@ mod feature_tests {
         assert_eq!(core.remote_contiguous_length(), 2);
         core.truncate(1, None).await.unwrap();
         assert_eq!(core.remote_contiguous_length(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_proofs_commit_each_node_once_without_trusting_a_failed_proof() {
+        use compact_encoding::hypercore::{RequestBlock, RequestUpgrade};
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source")).unwrap();
+        let writer = Core::open(
+            &source,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[22; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.append(&[b"a", b"b", b"c", b"d"]).await.unwrap();
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = Core::open(
+            &destination,
+            CoreOptions {
+                key: Some(*writer.key()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let upgrade = writer
+            .proof_for(
+                &ProofRequest {
+                    upgrade: Some(RequestUpgrade {
+                        start: 0,
+                        length: 4,
+                    }),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(reader.verify(upgrade).await.unwrap(), Some(true));
+        let proof = |index| {
+            writer
+                .proof_for(
+                    &ProofRequest {
+                        block: Some(RequestBlock { index, nodes: 2 }),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap()
+        };
+        let mut bad = proof(1);
+        bad.block.as_mut().unwrap().value = Bytes::from_static(b"bad");
+        let results = reader
+            .verify_blocks(&[proof(0), bad, proof(1), proof(2)])
+            .await;
+        assert!(matches!(results[0], Ok(Some(false))));
+        assert!(matches!(
+            results[1],
+            Err(CoreError::Merkle(MerkleError::InvalidChecksum(_)))
+        ));
+        assert!(matches!(results[2], Ok(Some(false))));
+        assert!(matches!(results[3], Ok(Some(false))));
+        assert_eq!(reader.storage().tree_nodes().unwrap().len(), 7);
+        destination.close();
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = Core::open(
+            &destination,
+            CoreOptions {
+                key: Some(*writer.key()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (index, value) in [b"a", b"b", b"c"].iter().enumerate() {
+            assert_eq!(
+                reader
+                    .get_raw_local(index as u64)
+                    .unwrap()
+                    .unwrap()
+                    .as_ref(),
+                *value
+            );
+        }
     }
 }

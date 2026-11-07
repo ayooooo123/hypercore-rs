@@ -88,6 +88,45 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
 - `cargo run --release --example storage_bench -- <dir> 1024` appends and reads back 1 GiB of
   512 KiB blocks through `Core`; the numbers are in
   [`hypercore-storage-rs`](../hypercore-storage-rs#throughput).
+- `cargo run --release --example replication_bench -- rust 10000` downloads an entire
+  10000-block core (1 KiB deterministic blocks) over an in-memory Protomux stream;
+  replace `rust` with `js` for npm Hypercore over loopback TCP/secret-stream.
+  Repeat with 1000 blocks and without `--release` for the dev profile. It reports
+  transfer wall time and process CPU-seconds, excluding source creation and the
+  subsequent every-block content check. CPU includes both Rust endpoints for
+  Rust-to-Rust, or Rust plus the JS sender for JS-to-Rust.
+
+Replication tree reads batch missing ancestors, proof siblings, and roots. The
+storage layer shares a bounded tree-node LRU across cores in a store. Shared
+block verification reuses authenticated nodes from earlier proofs in the same
+write batch; a parent hash is reused only when both children match exactly, and
+matching authenticated nodes are persisted only once per batch.
+
+Local arm64 Mac, 2026-11-07: medians of three interleaved fresh-core runs with
+1 KiB blocks. Baseline: hypercore `7e0f155`, storage `82e8cd9`; unchanged
+cryptography, stream, and storage format. These are synthetic local downloads,
+not an Android or real-network CPU certification.
+
+| Profile | Transfer | Blocks | CPU seconds before → after | Wall seconds before → after |
+| --- | --- | ---: | ---: | ---: |
+| release | Rust → Rust | 1000 | 0.015076 → 0.012769 | 0.010901 → 0.009581 |
+| release | Rust → Rust | 10000 | 0.177226 → 0.147845 | 0.120973 → 0.098150 |
+| release | JS → Rust | 1000 | 0.153970 → 0.152329 | 0.072305 → 0.066292 |
+| release | JS → Rust | 10000 | 1.104757 → 1.076564 | 0.478879 → 0.456003 |
+| dev | Rust → Rust | 1000 | 0.155082 → 0.154799 | 0.134075 → 0.137070 |
+| dev | Rust → Rust | 10000 | 1.750974 → 1.663616 | 1.355556 → 1.360207 |
+| dev | JS → Rust | 1000 | 0.457095 → 0.458508 | 0.306859 → 0.298475 |
+| dev | JS → Rust | 10000 | 4.099539 → 4.037683 | 2.879966 → 2.808512 |
+
+The tree-node LRU is one approximately 4 MiB budget per Store/Corestore, shared
+by all its cores and sessions, not per core. An 8192-node cache regressed the
+10000-block workload after eviction; the final bound is 32768 nodes.
+For 10000 blocks, `/usr/bin/time -l` peak RSS (including setup and content
+validation) was **41.88 → 47.66 MiB** release and **48.45 → 54.47 MiB** dev for
+Rust → Rust, which uses two separate stores. JS → Rust command peak RSS,
+including the sender child, was **131.00 → 133.17 MiB** release and
+**131.14 → 131.84 MiB** dev; it does not isolate the Rust reader's memory.
+Time the built example, not `cargo`, to reproduce command peak RSS.
 
 Where JS has a bug the port does not copy it: JS returns `NaN` for byte offsets past the first
 root, and so refuses (or silently drops) some valid seeks; Rust answers them.

@@ -53,8 +53,25 @@ fn invalid(m: impl Into<String>) -> MerkleError {
 pub trait NodeStore {
     fn node(&self, index: u64) -> Result<Option<Node>>;
 
-    fn has_node(&self, index: u64) -> Result<bool> {
-        Ok(self.node(index)?.is_some())
+    fn nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
+        indices.iter().map(|&index| self.node(index)).collect()
+    }
+
+    fn missing_prefix(&self, indices: impl Iterator<Item = u64>) -> Result<u64> {
+        let indices: Vec<_> = indices.collect();
+        Ok(self
+            .nodes(&indices)?
+            .iter()
+            .take_while(|node| node.is_none())
+            .count() as u64)
+    }
+
+    fn nodes_or_error(&self, indices: &[u64]) -> Result<Vec<Node>> {
+        self.nodes(indices)?
+            .into_iter()
+            .zip(indices)
+            .map(|(node, &index)| node.ok_or(MerkleError::MissingNode(index)))
+            .collect()
     }
 
     fn node_or_error(&self, index: u64) -> Result<Node> {
@@ -91,20 +108,15 @@ impl TreeState {
 
 /// Roots of the tree at `length`, read from storage.
 pub fn roots_at(store: &impl NodeStore, length: u64) -> Result<Vec<Node>> {
-    flat_tree::full_roots(2 * length)
-        .into_iter()
-        .map(|i| store.node_or_error(i))
-        .collect()
+    store.nodes_or_error(&flat_tree::full_roots(2 * length))
 }
 
 /// Whether every root for `length` is stored locally.
 pub fn upgradeable(store: &impl NodeStore, length: u64) -> Result<bool> {
-    for i in flat_tree::full_roots(2 * length) {
-        if !store.has_node(i)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    Ok(store
+        .nodes(&flat_tree::full_roots(2 * length))?
+        .iter()
+        .all(Option::is_some))
 }
 
 pub fn total_size(nodes: &[Node]) -> u64 {
@@ -657,13 +669,29 @@ pub fn truncate(store: &impl NodeStore, length: u64, batch: &mut Batch, fork: u6
 /// `MerkleTree.verify`: checks a remote proof against the local tree and
 /// returns the batch that applying it would commit.
 pub fn verify(state: &TreeState, store: &impl NodeStore, proof: &Data) -> Result<Batch> {
+    verify_cached(state, store, proof, &HashMap::new())
+}
+
+/// Reuse only nodes authenticated by an earlier successful proof in this write batch.
+pub(crate) fn verify_cached(
+    state: &TreeState,
+    store: &impl NodeStore,
+    proof: &Data,
+    known: &HashMap<u64, Node>,
+) -> Result<Batch> {
     let mut batch = Batch::new(state);
-    let mut unverified = verify_tree(proof, &mut batch.nodes)?;
+    let mut unverified = verify_tree_cached(proof, &mut batch.nodes, known)?;
     if proof.upgrade.is_some() && verify_upgrade(proof, unverified, &mut batch)? {
         unverified = None;
     }
     if let Some(u) = unverified {
-        let verified = store.node_or_error(u.index)?;
+        let verified = match known
+            .get(&u.index)
+            .or_else(|| state.roots.iter().find(|n| n.index == u.index))
+        {
+            Some(node) => *node,
+            None => store.node_or_error(u.index)?,
+        };
         if verified.hash != u.hash {
             return Err(MerkleError::InvalidChecksum(u.index));
         }
@@ -721,6 +749,24 @@ pub fn reorg(store: &impl NodeStore, proof: &Data, batch: &mut Batch) -> Result<
 }
 
 fn verify_tree(proof: &Data, nodes: &mut Vec<Node>) -> Result<Option<Node>> {
+    verify_tree_cached(proof, nodes, &HashMap::new())
+}
+
+fn verified_parent(index: u64, left: &Node, right: &Node, known: &HashMap<u64, Node>) -> Node {
+    if known.get(&left.index) == Some(left)
+        && known.get(&right.index) == Some(right)
+        && let Some(node) = known.get(&index)
+    {
+        return *node;
+    }
+    parent_node(index, left, right)
+}
+
+fn verify_tree_cached(
+    proof: &Data,
+    nodes: &mut Vec<Node>,
+    known: &HashMap<u64, Node>,
+) -> Result<Option<Node>> {
     let untrusted = match (&proof.block, &proof.hash) {
         (Some(b), _) => Some((2 * b.index, Some(&b.value), &b.nodes[..])),
         (None, Some(h)) => Some((h.index, None, &h.nodes[..])),
@@ -743,7 +789,7 @@ fn verify_tree(proof: &Data, nodes: &mut Vec<Node>) -> Result<Option<Node>> {
         nodes.push(r);
         while q.len() > 0 {
             let node = q.shift(ite.sibling())?;
-            r = parent_node(ite.parent(), &r, &node);
+            r = verified_parent(ite.parent(), &r, &node, known);
             nodes.push(node);
             nodes.push(r);
         }
@@ -762,7 +808,7 @@ fn verify_tree(proof: &Data, nodes: &mut Vec<Node>) -> Result<Option<Node>> {
     nodes.push(r);
     while q.len() > 0 {
         let node = q.shift(ite.sibling())?;
-        r = parent_node(ite.parent(), &r, &node);
+        r = verified_parent(ite.parent(), &r, &node, known);
         nodes.push(node);
         nodes.push(r);
     }
@@ -1032,7 +1078,7 @@ fn nodes_to_root(index: u64, nodes: u64, head: u64) -> Result<u64> {
 
 fn seek_proof(store: &impl NodeStore, seek_root: u64, root: u64, p: &mut Pending) -> Result<()> {
     let mut ite = Iter::new(seek_root);
-    let mut seek = vec![store.node_or_error(ite.index)?];
+    let mut indices = vec![ite.index];
     let mut cnt = 0;
     while ite.index != root {
         cnt += 1;
@@ -1042,10 +1088,10 @@ fn seek_proof(store: &impl NodeStore, seek_root: u64, root: u64, p: &mut Pending
             )));
         }
         ite.sibling();
-        seek.push(store.node_or_error(ite.index)?);
+        indices.push(ite.index);
         ite.parent();
     }
-    p.seek = Some(seek);
+    p.seek = Some(store.nodes_or_error(&indices)?);
     Ok(())
 }
 
@@ -1061,9 +1107,9 @@ fn block_and_seek_proof(
         return seek_proof(store, seek_root, root, p);
     };
     let mut ite = Iter::new(node.index);
-    let mut out = vec![];
+    let mut indices = vec![];
     if !node.value {
-        out.push(store.node_or_error(ite.index)?);
+        indices.push(ite.index);
     }
     let mut cnt = 0;
     while ite.index != root {
@@ -1077,11 +1123,11 @@ fn block_and_seek_proof(
         if seek && ite.contains(seek_root) && ite.index != seek_root {
             seek_proof(store, seek_root, ite.index, p)?;
         } else {
-            out.push(store.node_or_error(ite.index)?);
+            indices.push(ite.index);
         }
         ite.parent();
     }
-    p.node = Some(out);
+    p.node = Some(store.nodes_or_error(&indices)?);
     Ok(())
 }
 
@@ -1096,6 +1142,7 @@ fn upgrade_proof(
     p: &mut Pending,
     nodes: &mut Vec<Node>,
 ) -> Result<()> {
+    let mut indices = vec![];
     let mut connected = from == 0;
     let mut ite = Iter::new(0);
     while ite.full_root(to) {
@@ -1122,7 +1169,7 @@ fn upgrade_proof(
                     if p.node.is_none() && p.seek.is_none() && ite.contains(sub_tree) {
                         block_and_seek_proof(store, node, seek, sub_tree, ite.index, p)?;
                     } else {
-                        nodes.push(store.node_or_error(ite.index)?);
+                        indices.push(ite.index);
                     }
                 }
                 ite.parent();
@@ -1137,9 +1184,10 @@ fn upgrade_proof(
             ite.next_tree();
             continue;
         }
-        nodes.push(store.node_or_error(ite.index)?);
+        indices.push(ite.index);
         ite.next_tree();
     }
+    nodes.extend(store.nodes_or_error(&indices)?);
     Ok(())
 }
 
@@ -1233,17 +1281,21 @@ pub fn missing_nodes(store: &impl NodeStore, index: u64, length: u64) -> Result<
     if ite.peek_right_span() >= head {
         return Ok(0);
     }
-    let mut cnt = 0;
-    while !ite.contains(head) && !store.has_node(ite.index)? {
-        cnt += 1;
-        if cnt >= 1024 {
-            return Err(MerkleError::InvalidOperation(format!(
-                "Bad arguments to missingNodes index={index} at length={length}"
-            )));
+    let ancestors = std::iter::from_fn(move || {
+        if ite.contains(head) {
+            return None;
         }
+        let index = ite.index;
         ite.parent();
+        Some(index)
+    });
+    let count = store.missing_prefix(ancestors.take(64))?;
+    if count == 64 {
+        return Err(invalid(format!(
+            "Bad arguments to missingNodes index={index} at length={length}"
+        )));
     }
-    Ok(cnt)
+    Ok(count)
 }
 
 /// `MerkleTree.maxMissingNodes`.
@@ -1359,5 +1411,110 @@ pub fn refit(state: &TreeState, store: &impl NodeStore, proof: &Data) -> Result<
         }
         Err(_) if nodes.insufficient.get() => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct Batched {
+        nodes: HashMap<u64, Node>,
+        reads: Cell<usize>,
+    }
+
+    impl NodeStore for Batched {
+        fn node(&self, _: u64) -> Result<Option<Node>> {
+            panic!("expected one batched read, not a point read")
+        }
+
+        fn nodes(&self, indices: &[u64]) -> Result<Vec<Option<Node>>> {
+            self.reads.set(self.reads.get() + 1);
+            Ok(indices.iter().map(|i| self.nodes.get(i).copied()).collect())
+        }
+    }
+
+    #[test]
+    fn missing_ancestors_and_proof_siblings_are_batched() {
+        let mut batch = Batch::new(&TreeState::default());
+        for i in 0..8 {
+            batch.append(&[i]);
+        }
+        let state = batch.state();
+        let nodes = batch.nodes.iter().map(|n| (n.index, *n)).collect();
+        let mut store = Batched {
+            nodes,
+            reads: Cell::new(0),
+        };
+        assert_eq!(missing_nodes(&store, 0, 8).unwrap(), 0);
+        assert_eq!(store.reads.get(), 1);
+        let req = ProofRequest {
+            block: Some(RequestBlock { index: 0, nodes: 3 }),
+            ..Default::default()
+        };
+        assert_eq!(
+            proof(&state, &store, &req)
+                .unwrap()
+                .block
+                .unwrap()
+                .nodes
+                .len(),
+            3
+        );
+        assert_eq!(store.reads.get(), 2);
+        store.nodes.retain(|&index, _| index == 7);
+        assert_eq!(missing_nodes(&store, 0, 8).unwrap(), 3);
+        assert_eq!(missing_nodes(&store, 16, 8).unwrap(), 0);
+        assert_eq!(store.reads.get(), 3);
+    }
+
+    #[test]
+    fn shared_verification_reuses_only_matching_authenticated_nodes() {
+        let mut batch = Batch::new(&TreeState::default());
+        for i in 0..8 {
+            batch.append(&[i]);
+        }
+        let state = batch.state();
+        let store: HashMap<_, _> = batch.nodes.iter().map(|n| (n.index, *n)).collect();
+        let make_proof = |index| {
+            let mut data = proof(
+                &state,
+                &store,
+                &ProofRequest {
+                    block: Some(RequestBlock { index, nodes: 3 }),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            data.block.as_mut().unwrap().value = Bytes::copy_from_slice(&[index as u8]);
+            data
+        };
+        let first = verify(&state, &HashMap::new(), &make_proof(0)).unwrap();
+        let known = first.nodes.iter().map(|n| (n.index, *n)).collect();
+        let second = make_proof(1);
+        assert_eq!(
+            verify_cached(&state, &HashMap::new(), &second, &known)
+                .unwrap()
+                .nodes,
+            verify(&state, &store, &second).unwrap().nodes
+        );
+        let mut bad = second;
+        bad.block.as_mut().unwrap().nodes[1].hash[0] ^= 1;
+        assert!(matches!(
+            verify_cached(&state, &store, &bad, &known),
+            Err(MerkleError::InvalidChecksum(_))
+        ));
+        let left = store[&0];
+        let right = store[&2];
+        assert_eq!(verified_parent(1, &left, &right, &known), store[&1]);
+        let changed = Node {
+            hash: [9; 32],
+            ..left
+        };
+        assert_eq!(
+            verified_parent(1, &changed, &right, &known),
+            parent_node(1, &changed, &right)
+        );
     }
 }

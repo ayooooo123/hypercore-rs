@@ -44,6 +44,11 @@ async function write() {
     .createInterface({ input: process.stdin })
     .on('line', async (line) => {
       const [cmd, n] = line.split(' ')
+      if (cmd === 'cpu') {
+        const usage = process.cpuUsage()
+        log('cpu ' + (usage.user + usage.system) / 1e6)
+        return
+      }
       if (cmd !== 'truncate') return
       await core.truncate(Number(n))
       await core.append([Buffer.from('fork-0'), Buffer.from('fork-1'), Buffer.from('fork-2')])
