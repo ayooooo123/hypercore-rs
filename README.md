@@ -69,6 +69,10 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
   reads, with SHA-256 of every byte compared. The size is `HC_INTEROP_MB` (default 32); the 1 GiB
   run is `HC_INTEROP_MB=1024 cargo test --release --test replicate_dht -- --include-ignored --test-threads 1`.
   It needs the peeroxide fork next to this repo (`../peeroxide`, patched in `Cargo.toml`).
+  The same suite includes Rust-to-Rust and JS-to-JS baselines. `PERF` lines exclude
+  discovery/setup and byte verification from transfer throughput; CPU-seconds per
+  GiB use the reader process for mixed/JS runs and both endpoints for Rust-to-Rust.
+  CPU reporting requires Unix `ps`; these opt-in runs use private temporary stores.
 - `tests/storage_switch.rs` (needs `npm install` in `tests/js`): npm corestore 7.16.1 writes a
   store with ten cores, then JS and Rust take turns opening that same directory, appending, writing
   user data, and comparing every core's length, tree and blocks. `tests/storage_crash.rs` kills a

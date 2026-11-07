@@ -47,6 +47,17 @@ fn block(i: u64, size: usize) -> Vec<u8> {
     out
 }
 
+fn cpu_seconds(pid: u32) -> f64 {
+    let out = std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "time="])
+        .output()
+        .unwrap();
+    let time = String::from_utf8(out.stdout).unwrap();
+    time.trim().split(':').fold(0.0, |total, part| {
+        total * 60.0 + part.parse::<f64>().unwrap()
+    })
+}
+
 fn sha256_hex(parts: impl Iterator<Item = Vec<u8>>) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -88,6 +99,9 @@ async fn line(out: &mut Lines<BufReader<ChildStdout>>, prefix: &str) -> String {
             .unwrap()
             .unwrap_or_else(|| panic!("node exited before {prefix:?}"));
         assert!(!l.starts_with("error"), "{l}");
+        if l.starts_with("PERF ") {
+            eprintln!("{l}");
+        }
         if let Some(rest) = l.strip_prefix(prefix) {
             return rest.trim().to_owned();
         }
@@ -166,6 +180,9 @@ async fn js_swarm_writes_rust_swarm_reads() {
             .unwrap()
     );
     assert_eq!(core.length(), n);
+    eprintln!("TRANSFER pid={}", std::process::id());
+    let cpu = cpu_seconds(std::process::id());
+    let transfer = Instant::now();
     assert!(
         timeout(Duration::from_secs(1800), core.download(0, Some(n), false))
             .await
@@ -173,6 +190,12 @@ async fn js_swarm_writes_rust_swarm_reads() {
             .unwrap()
     );
     let secs = started.elapsed().as_secs_f64();
+    let elapsed = transfer.elapsed().as_secs_f64();
+    eprintln!(
+        "PERF js->rust {:.2} MiB/s {:.2} reader CPU-s/GiB",
+        mib(n) as f64 / elapsed,
+        (cpu_seconds(std::process::id()) - cpu) * 1024.0 / mib(n) as f64
+    );
     eprintln!(
         "js->rust over udx: {} MiB in {secs:.2}s ({:.1} MiB/s)",
         mib(n),
@@ -241,6 +264,116 @@ async fn rust_swarm_writes_js_swarm_reads() {
     assert_eq!(parts[1], n.to_string());
     assert_eq!(parts[0], sha256_hex((0..n).map(|i| block(i, BLOCK))));
     let _ = swarm.destroy().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "local HyperDHT throughput benchmark; needs node and tests/js dependencies"]
+async fn rust_swarm_writes_rust_swarm_reads() {
+    let n = blocks();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_testnet, mut tn) = node(&["testnet"]);
+    let port = line(&mut tn, "bootstrap ").await;
+    let writer_store = Store::open(&tmp.path().join("writer")).unwrap();
+    let writer = Core::open(
+        &writer_store,
+        CoreOptions {
+            key_pair: Some(KeyPair::from_seed(&[0x33; 32])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _writer_session = writer.session(true);
+    for chunk in (0..n).collect::<Vec<_>>().chunks(64) {
+        let data: Vec<Vec<u8>> = chunk.iter().map(|&i| block(i, BLOCK)).collect();
+        writer.append(&data).await.unwrap();
+    }
+    let (server, conns) = rust_swarm(&port).await;
+    replicate_all(writer.clone(), conns);
+    server
+        .join(*writer.discovery_key(), opts(false))
+        .await
+        .unwrap();
+    server.flush().await.unwrap();
+    let reader_store = Store::open(&tmp.path().join("reader")).unwrap();
+    let reader = Core::open(
+        &reader_store,
+        CoreOptions {
+            key: Some(*writer.key()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let _reader_session = reader.session(true);
+    let (client, conns) = rust_swarm(&port).await;
+    replicate_all(reader.clone(), conns);
+    client
+        .join(*reader.discovery_key(), opts(true))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(60), reader.update(None))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reader.length(), n);
+    eprintln!("TRANSFER pid={}", std::process::id());
+    let cpu = cpu_seconds(std::process::id());
+    let transfer = Instant::now();
+    assert!(
+        timeout(
+            Duration::from_secs(1800),
+            reader.download(0, Some(n), false)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+    );
+    let elapsed = transfer.elapsed().as_secs_f64();
+    eprintln!(
+        "PERF rust->rust {:.2} MiB/s {:.2} combined CPU-s/GiB",
+        mib(n) as f64 / elapsed,
+        (cpu_seconds(std::process::id()) - cpu) * 1024.0 / mib(n) as f64
+    );
+    for i in 0..n {
+        assert_eq!(
+            reader
+                .get(i, GetOptions::default())
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            block(i, BLOCK)
+        );
+    }
+    client.destroy().await.unwrap();
+    server.destroy().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "local JS HyperDHT baseline; needs node and tests/js dependencies"]
+async fn js_swarm_writes_js_swarm_reads() {
+    let n = blocks();
+    let tmp = tempfile::tempdir().unwrap();
+    let (_testnet, mut tn) = node(&["testnet"]);
+    let port = line(&mut tn, "bootstrap ").await;
+    let writer_dir = tmp.path().join("writer");
+    let (_writer, mut writer_out) = node(&[
+        "write",
+        &port,
+        writer_dir.to_str().unwrap(),
+        &n.to_string(),
+        &BLOCK.to_string(),
+        &"11".repeat(32),
+    ]);
+    let key = line(&mut writer_out, "key ").await;
+    line(&mut writer_out, "ready").await;
+    let reader_dir = tmp.path().join("reader");
+    let (_reader, mut reader_out) = node(&["read", &port, reader_dir.to_str().unwrap(), &key]);
+    let report = timeout(Duration::from_secs(1800), line(&mut reader_out, "sha256 "))
+        .await
+        .unwrap();
+    let parts: Vec<_> = report.split(' ').collect();
+    assert_eq!(parts[0], sha256_hex((0..n).map(|i| block(i, BLOCK))));
+    assert_eq!(parts[1], n.to_string());
 }
 
 fn hex_bytes(s: &str) -> Vec<u8> {
