@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
-use compact_encoding::hypercore::{Data, Manifest, Node};
 use compact_encoding::Bytes;
+use compact_encoding::hypercore::{Data, Manifest, Node};
 use tokio::sync::{broadcast, watch};
 
 use crate::bitfield::Bitfield;
@@ -209,9 +209,7 @@ pub(crate) struct Header {
     pub secret_key: Option<[u8; 64]>,
     pub fork: u64,
     pub length: u64,
-    pub root_hash: [u8; 32],
     pub signature: Option<Bytes>,
-    pub timestamp: u64,
     pub contiguous_length: u64,
     pub remote_contiguous_length: u64,
     pub frozen: bool,
@@ -233,9 +231,7 @@ impl Header {
             secret_key: auth.key_pair.as_ref().and_then(|pair| pair.secret_key),
             fork: head.fork,
             length: head.length,
-            root_hash: head.root_hash,
             signature: head.signature,
-            timestamp: head.timestamp,
             contiguous_length: hints.contiguous_length,
             remote_contiguous_length: hints.remote_contiguous_length,
             frozen: hints.recovering != 0,
