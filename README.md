@@ -76,6 +76,9 @@ branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window
 - `cargo run --release --example crypto_bench` measures the per-block crypto. On an Apple M-series
   laptop (aarch64), it does blake2b leaf hashing at ~930 MiB/s, XSalsa20 at ~600 MiB/s (512 KiB
   blocks), ed25519 signing at ~36k/s and verifying at ~24k/s.
+- `cargo run --release --example storage_bench -- <dir> 1024` appends and reads back 1 GiB of
+  512 KiB blocks through `Core`; the numbers are in
+  [`hypercore-storage-rs`](../hypercore-storage-rs#throughput).
 
 Where JS has a bug the port does not copy it: JS returns `NaN` for byte offsets past the first
 root, and so refuses (or silently drops) some valid seeks; Rust answers them.
