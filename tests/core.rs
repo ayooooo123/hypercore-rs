@@ -281,3 +281,36 @@ async fn a_downloaded_manifest_survives_reopening() {
         "the learned manifest is stored, not just remembered"
     );
 }
+
+#[tokio::test]
+async fn seek_past_the_local_length_waits_for_a_peer() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (sa, sb) = (
+        Store::open(da.path()).unwrap(),
+        Store::open(db.path()).unwrap(),
+    );
+    let a = writer(&sa, 11);
+    let blocks: Vec<Vec<u8>> = (0..8u8).map(|i| vec![i; 1000]).collect();
+    a.append(&blocks).await.unwrap();
+    let b = reader(&sb, a.key());
+    let _session = b.session(true);
+    let (ma, mb) = link();
+    a.replicate(&ma);
+    b.replicate(&mb);
+
+    // Nothing is local yet: an empty core asked for a middle offset still resolves, as a peer's
+    // seek reply carries the position. Without the wait this is `None` and playback 404s.
+    assert_eq!(b.length(), 0);
+    let (index, offset) = timeout(T, b.seek(2500, true))
+        .await
+        .expect("seek waits for the peer")
+        .unwrap()
+        .expect("the peer's position");
+    assert_eq!((index, offset), (2, 500));
+    let got = timeout(T, b.get(index, GetOptions::default()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, blocks[2]);
+}

@@ -563,12 +563,7 @@ pub fn seek(
     bytes: u64,
     padding: u64,
 ) -> Result<Option<Seek>> {
-    let size = state.byte_length - state.length * padding;
-    let (start, end) = if bytes >= size {
-        (state.length, 0)
-    } else {
-        (0, state.length)
-    };
+    let (start, end) = seek_window(state, bytes, padding);
     let Some((index, rem)) = seek_local(state, store, bytes, padding)? else {
         return Ok(if start < end {
             Some(Seek::Need { start, end })
@@ -584,6 +579,17 @@ pub fn seek(
         start: s0 / 2,
         end: s1 / 2 + 1,
     }))
+}
+
+/// `ByteSeeker`'s `start`/`end`: the local block span a peer is asked about for `bytes`.
+/// At or past the local length it is `(length, 0)` — the JS replicator still sends the seek.
+pub fn seek_window(state: &TreeState, bytes: u64, padding: u64) -> (u64, u64) {
+    let size = state.byte_length - state.length * padding;
+    if bytes >= size {
+        (state.length, 0)
+    } else {
+        (0, state.length)
+    }
 }
 
 fn seek_local(

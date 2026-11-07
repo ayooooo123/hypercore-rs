@@ -880,16 +880,34 @@ impl Core {
     }
 
     /// Finds the block holding byte `bytes` (of plaintext).
+    ///
+    /// `wait` matches the JS session's: a seek past the local tree is answered by a peer (the
+    /// replicator's seek request), so an empty core asked for a middle offset still resolves
+    /// instead of reporting nothing.
     pub async fn seek(&self, bytes: u64, wait: bool) -> Result<Option<(u64, u64)>> {
         let padding = self.padding() as u64;
         loop {
-            let found = {
+            let (found, window) = {
                 let st = self.state();
-                merkle::seek(&st.tree, &self.inner.storage, bytes, padding)?
+                (
+                    merkle::seek(&st.tree, &self.inner.storage, bytes, padding)?,
+                    merkle::seek_window(&st.tree, bytes, padding),
+                )
             };
             match found {
                 Some(merkle::Seek::Found(i, off)) => return Ok(Some((i, off))),
-                None => return Ok(None),
+                None if !wait => return Ok(None),
+                // At or past the local byte length: the position comes from a peer's tree.
+                None => {
+                    let (start, end) = window;
+                    if !self
+                        .replicator()
+                        .request_seek(bytes, padding, start, end)
+                        .await?
+                    {
+                        return Ok(None);
+                    }
+                }
                 Some(merkle::Seek::Need { .. }) if !wait => return Ok(None),
                 Some(merkle::Seek::Need { start, end }) => {
                     self.replicator()
