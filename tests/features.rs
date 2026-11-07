@@ -3,6 +3,65 @@ use hypercore::{
 };
 
 #[tokio::test]
+async fn request_bag_is_sticky_and_scoped() {
+    use hypercore::RequestBag;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let core = Core::open(
+        &store,
+        CoreOptions {
+            key_pair: Some(KeyPair::from_seed(&[7; 32])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let cancelled = RequestBag::new();
+    let other = RequestBag::new();
+    let first = core.get(
+        0,
+        GetOptions {
+            bag: Some(cancelled.clone()),
+            ..Default::default()
+        },
+    );
+    let second = core.get(
+        0,
+        GetOptions {
+            bag: Some(other),
+            ..Default::default()
+        },
+    );
+    tokio::pin!(first, second);
+    tokio::select! {
+        _ = &mut first => panic!("request completed prematurely"),
+        _ = &mut second => panic!("request completed prematurely"),
+        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+    }
+    cancelled.destroy("stopped");
+    cancelled.destroy("ignored");
+    assert!(
+        matches!(first.await, Err(CoreError::CancelledWithReason(reason)) if reason == "stopped")
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut second)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        core.get(0, GetOptions { bag: Some(cancelled), ..Default::default() }).await,
+        Err(CoreError::CancelledWithReason(reason)) if reason == "stopped"
+    ));
+    let bag = RequestBag::new();
+    let range = core.download_with_bag(0, Some(1), false, bag.clone());
+    bag.destroy("registration");
+    assert!(
+        matches!(range.await, Err(CoreError::CancelledWithReason(reason)) if reason == "registration")
+    );
+}
+
+#[tokio::test]
 async fn metadata_hash_events_and_close() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();

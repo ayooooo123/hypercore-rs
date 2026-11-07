@@ -138,6 +138,7 @@ enum Cmd {
     },
     Cancel(WaiterId),
     SyncActive,
+    SetInflightRange((u32, u32)),
     Appended {
         start: u64,
         length: u64,
@@ -297,6 +298,10 @@ impl Replicator {
 
     pub(crate) fn sync_active(&self) {
         self.send(Cmd::SyncActive);
+    }
+
+    pub(crate) fn set_inflight_range(&self, range: (u32, u32)) {
+        self.send(Cmd::SetInflightRange(range));
     }
 
     pub(crate) fn on_append(&self, start: u64, length: u64) {
@@ -729,6 +734,12 @@ impl Actor {
             }
             Cmd::Cancel(waiter) => self.cancel(core, waiter),
             Cmd::SyncActive => self.set_active(core, core.effective_active()),
+            Cmd::SetInflightRange((min, max)) => {
+                for peer in self.peers.iter_mut().flatten() {
+                    peer.inflight_range = (min as usize, max as usize);
+                }
+                self.update_all(core);
+            }
             Cmd::Appended { start, length } => {
                 self.on_upgrade(core);
                 self.on_have(core, start, length, false);
@@ -822,8 +833,7 @@ impl Actor {
             remote_supports_seeks: false,
             inflight: 0,
             inflight_range: core
-                .inner
-                .inflight_range
+                .inflight_range()
                 .map_or(DEFAULT_MAX_INFLIGHT, |(min, max)| {
                     (min as usize, max as usize)
                 }),

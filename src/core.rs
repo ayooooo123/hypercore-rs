@@ -3,7 +3,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use compact_encoding::hypercore::{Data, Manifest};
@@ -30,6 +30,7 @@ pub enum CoreError {
     NotFound,
     Timeout,
     Cancelled,
+    CancelledWithReason(String),
     /// The block was truncated away while being requested.
     SnapshotNotAvailable,
     Closed,
@@ -51,6 +52,7 @@ impl fmt::Display for CoreError {
             Self::NotFound => f.write_str("core not found in storage"),
             Self::Timeout => f.write_str("REQUEST_TIMEOUT"),
             Self::Cancelled => f.write_str("REQUEST_CANCELLED"),
+            Self::CancelledWithReason(reason) => write!(f, "REQUEST_CANCELLED: {reason}"),
             Self::SnapshotNotAvailable => f.write_str("SNAPSHOT_NOT_AVAILABLE"),
             Self::Closed => f.write_str("SESSION_CLOSED"),
         }
@@ -75,6 +77,62 @@ impl From<MerkleError> for CoreError {
 }
 
 pub type Result<T, E = CoreError> = std::result::Result<T, E>;
+/// A shared, sticky cancellation scope for block and range requests.
+#[derive(Debug, Clone)]
+pub struct RequestBag {
+    reason: watch::Sender<Option<String>>,
+}
+
+impl Default for RequestBag {
+    fn default() -> Self {
+        Self {
+            reason: watch::channel(None).0,
+        }
+    }
+}
+
+impl RequestBag {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn destroy(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        self.reason.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(reason);
+                true
+            }
+        });
+    }
+
+    fn error(&self) -> Option<CoreError> {
+        self.reason
+            .borrow()
+            .clone()
+            .map(CoreError::CancelledWithReason)
+    }
+
+    async fn cancelled(&self) -> CoreError {
+        let mut receiver = self.reason.subscribe();
+        loop {
+            if let Some(reason) = receiver.borrow_and_update().clone() {
+                return CoreError::CancelledWithReason(reason);
+            }
+            let _ = receiver.changed().await;
+        }
+    }
+}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 impl NodeStore for CoreStorage {
     fn node(&self, index: u64) -> merkle::Result<Option<compact_encoding::hypercore::Node>> {
@@ -344,12 +402,15 @@ pub(crate) struct Inner {
     pub discovery_key: [u8; 32],
     state: Mutex<State>,
     write: tokio::sync::Mutex<()>,
+    exclusive: Arc<tokio::sync::Mutex<()>>,
     head: watch::Sender<Head>,
     events: broadcast::Sender<CoreEvent>,
     closed: AtomicBool,
-    pub(crate) inflight_range: Option<(u32, u32)>,
+    pub(crate) inflight_range: Mutex<Option<(u32, u32)>>,
     pub replicator: OnceLock<Replicator>,
     sessions: AtomicUsize,
+    session_lifecycle: Mutex<()>,
+    leases: AtomicUsize,
     active_sessions: AtomicUsize,
     manually_active: AtomicBool,
     peers: AtomicUsize,
@@ -475,12 +536,15 @@ impl Core {
                 store,
                 state: Mutex::new(state),
                 write: tokio::sync::Mutex::new(()),
+                exclusive: Arc::new(tokio::sync::Mutex::new(())),
                 head: watch::channel(head).0,
                 events: broadcast::channel(256).0,
                 closed: AtomicBool::new(false),
-                inflight_range: opts.inflight_range,
+                inflight_range: Mutex::new(opts.inflight_range),
                 replicator: OnceLock::new(),
                 sessions: AtomicUsize::new(0),
+                session_lifecycle: Mutex::new(()),
+                leases: AtomicUsize::new(0),
                 active_sessions: AtomicUsize::new(0),
                 manually_active: AtomicBool::new(false),
                 peers: AtomicUsize::new(0),
@@ -594,6 +658,26 @@ impl Core {
         &self.inner.storage
     }
 
+    /// Changes the replication window for current and future peers.
+    pub fn set_inflight_range(&self, range: (u32, u32)) {
+        *self
+            .inner
+            .inflight_range
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(range);
+        if let Some(replicator) = self.inner.replicator.get() {
+            replicator.set_inflight_range(range);
+        }
+    }
+
+    pub fn inflight_range(&self) -> Option<(u32, u32)> {
+        *self
+            .inner
+            .inflight_range
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Watches the head; changes on append, download upgrades and truncation.
     pub fn subscribe(&self) -> watch::Receiver<Head> {
         self.inner.head.subscribe()
@@ -620,6 +704,10 @@ impl Core {
     /// (a Protomux pair request for this core's discovery key).
     pub fn replicate_paired(&self, mux: &protomux::Mux, pairing: protomux::PairRequest) {
         self.replicator().attach(mux, Some(pairing));
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::Acquire) || self.inner.store.is_closed()
     }
 
     /// Stops replicating: closes every channel of this core.
@@ -677,6 +765,9 @@ impl Core {
 
     /// A block, downloading it from peers if `wait` (the default).
     pub async fn get(&self, index: u64, opts: GetOptions) -> Result<Option<Bytes>> {
+        if let Some(error) = opts.bag.as_ref().and_then(RequestBag::error) {
+            return Err(error);
+        }
         let local = if opts.raw {
             self.get_raw_local(index)?
         } else {
@@ -689,11 +780,22 @@ impl Core {
             return Ok(None);
         }
         let req = self.replicator().request_block(index, opts.force);
-        let raw = match opts.timeout {
-            Some(t) => tokio::time::timeout(t, req)
-                .await
-                .map_err(|_| CoreError::Timeout)??,
-            None => req.await?,
+        let request = async {
+            match opts.timeout {
+                Some(t) => tokio::time::timeout(t, req)
+                    .await
+                    .map_err(|_| CoreError::Timeout)?,
+                None => req.await,
+            }
+        };
+        let raw = if let Some(bag) = &opts.bag {
+            tokio::select! {
+                biased;
+                error = bag.cancelled() => return Err(error),
+                result = request => result?,
+            }
+        } else {
+            request.await?
         };
         Ok(Some(if opts.raw {
             raw
@@ -723,6 +825,25 @@ impl Core {
         linear: bool,
     ) -> impl Future<Output = Result<bool>> + Send + use<> {
         self.replicator().request_range(start, end, linear)
+    }
+
+    /// Downloads a range until completion or cancellation of its request bag.
+    pub fn download_with_bag(
+        &self,
+        start: u64,
+        end: Option<u64>,
+        linear: bool,
+        bag: RequestBag,
+    ) -> impl Future<Output = Result<bool>> + Send + use<> {
+        let request = self.replicator().request_range(start, end, linear);
+        let mut task = AbortOnDrop(tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                error = bag.cancelled() => Err(error),
+                result = request => result,
+            }
+        }));
+        async move { (&mut task.0).await.unwrap_or(Err(CoreError::Closed)) }
     }
 
     /// Finds the block holding byte `bytes` (of plaintext).
@@ -1008,6 +1129,11 @@ impl Core {
 
     /// Opens a session; `active: false` sessions don't keep the core downloading.
     pub fn session(&self, active: bool) -> Session {
+        let _lifecycle = self
+            .inner
+            .session_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.inner.sessions.fetch_add(1, Ordering::AcqRel);
         if active {
             self.inner.active_sessions.fetch_add(1, Ordering::AcqRel);
@@ -1015,7 +1141,12 @@ impl Core {
         }
         Session {
             core: self.clone(),
-            active,
+            state: Arc::new(SessionState {
+                core: self.clone(),
+                active: Mutex::new(Some(active)),
+                lease: Mutex::new(None),
+                closed: watch::channel(false).0,
+            }),
         }
     }
 
@@ -1370,13 +1501,14 @@ fn write_tree_ops(batch: &mut Batch, sb: &mut storage::Batch) {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GetOptions {
     pub wait: bool,
     pub timeout: Option<Duration>,
     /// Request even if the remote has not signalled it can upgrade us.
     pub force: bool,
     pub raw: bool,
+    pub bag: Option<RequestBag>,
 }
 
 impl Default for GetOptions {
@@ -1386,15 +1518,92 @@ impl Default for GetOptions {
             timeout: None,
             force: false,
             raw: false,
+            bag: None,
         }
     }
 }
 
-/// A session on a core. `active` sessions keep the replicator downloading;
-/// dropping the last one lets it go idle.
+/// An exclusive permit tied to one physical core.
+pub struct ExclusiveLease {
+    core: Core,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl Drop for ExclusiveLease {
+    fn drop(&mut self) {
+        let inner = &self.core.inner;
+        let _lifecycle = inner
+            .session_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if inner.leases.fetch_sub(1, Ordering::AcqRel) == 1
+            && inner.sessions.load(Ordering::Acquire) == 0
+        {
+            self.core.close();
+        }
+    }
+}
+
+struct SessionState {
+    core: Core,
+    active: Mutex<Option<bool>>,
+    lease: Mutex<Option<ExclusiveLease>>,
+    closed: watch::Sender<bool>,
+}
+
+/// A weak session registration, used by store scopes.
+pub struct WeakSession(Weak<SessionState>);
+
+impl WeakSession {
+    pub fn is_alive(&self) -> bool {
+        self.0.strong_count() != 0
+    }
+
+    pub fn close(&self) {
+        if let Some(state) = self.0.upgrade() {
+            state.close();
+        }
+    }
+}
+
+impl SessionState {
+    fn close(&self) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(was_active) = active.take() else {
+            return;
+        };
+        self.closed.send_replace(true);
+        self.lease.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let inner = &self.core.inner;
+        let _lifecycle = inner
+            .session_lifecycle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inner.sessions.fetch_sub(1, Ordering::AcqRel);
+        if was_active {
+            inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
+            if let Some(r) = inner.replicator.get() {
+                r.sync_active();
+            }
+        }
+        if inner.sessions.load(Ordering::Acquire) == 0 && inner.leases.load(Ordering::Acquire) == 0
+        {
+            self.core.close();
+        }
+        self.core.check_if_idle();
+    }
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// A session on a physical core.
 pub struct Session {
     core: Core,
-    active: bool,
+    state: Arc<SessionState>,
 }
 
 impl Session {
@@ -1402,15 +1611,215 @@ impl Session {
         &self.core
     }
 
+    pub fn key(&self) -> &[u8; 32] {
+        self.core.key()
+    }
+    pub fn discovery_key(&self) -> &[u8; 32] {
+        self.core.discovery_key()
+    }
+    pub fn head(&self) -> Head {
+        self.core.head()
+    }
+    pub fn length(&self) -> u64 {
+        self.core.length()
+    }
+    pub fn byte_length(&self) -> u64 {
+        self.core.byte_length()
+    }
+    pub fn fork(&self) -> u64 {
+        self.core.fork()
+    }
+    pub fn contiguous_length(&self) -> u64 {
+        self.core.contiguous_length()
+    }
+    pub fn remote_contiguous_length(&self) -> u64 {
+        self.core.remote_contiguous_length()
+    }
+    pub fn writable(&self) -> bool {
+        self.core.writable()
+    }
+    pub fn manifest(&self) -> Option<Manifest> {
+        self.core.manifest()
+    }
+    pub fn padding(&self) -> usize {
+        self.core.padding()
+    }
+    pub fn inflight_range(&self) -> Option<(u32, u32)> {
+        self.core.inflight_range()
+    }
+    pub fn subscribe(&self) -> watch::Receiver<Head> {
+        self.core.subscribe()
+    }
+    pub fn events(&self) -> broadcast::Receiver<CoreEvent> {
+        self.core.events()
+    }
+    pub fn has(&self, index: u64) -> bool {
+        self.core.has(index)
+    }
+    pub fn has_range(&self, start: u64, end: u64) -> bool {
+        self.core.has_range(start, end)
+    }
+    pub fn byte_range(&self, index: u64) -> Result<(u64, u64)> {
+        self.ensure_open()?;
+        self.core.byte_range(index)
+    }
+    pub async fn tree_hash(&self, length: u64) -> Result<[u8; 32]> {
+        self.ensure_open()?;
+        self.core.tree_hash(length).await
+    }
+    pub fn download(
+        &self,
+        start: u64,
+        end: Option<u64>,
+        linear: bool,
+    ) -> impl Future<Output = Result<bool>> + Send + use<> {
+        let mut closed = self.state.closed.subscribe();
+        let request = self
+            .ensure_open()
+            .map(|()| self.core.download(start, end, linear));
+        async move {
+            let request = request?;
+            if *closed.borrow() {
+                return Err(CoreError::Closed);
+            }
+            tokio::select! {
+                result = request => result,
+                _ = closed.changed() => Err(CoreError::Closed),
+            }
+        }
+    }
+    pub fn download_with_bag(
+        &self,
+        start: u64,
+        end: Option<u64>,
+        linear: bool,
+        bag: RequestBag,
+    ) -> impl Future<Output = Result<bool>> + Send + use<> {
+        let mut closed = self.state.closed.subscribe();
+        let request = self
+            .ensure_open()
+            .map(|()| self.core.download_with_bag(start, end, linear, bag));
+        async move {
+            let request = request?;
+            if *closed.borrow() {
+                return Err(CoreError::Closed);
+            }
+            tokio::select! {
+                result = request => result,
+                _ = closed.changed() => Err(CoreError::Closed),
+            }
+        }
+    }
+
+    pub fn downgrade(&self) -> WeakSession {
+        WeakSession(Arc::downgrade(&self.state))
+    }
+
+    pub fn close(&self) {
+        self.state.close();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.core.is_closed()
+            || self
+                .state
+                .active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none()
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closed() {
+            Err(CoreError::Closed)
+        } else {
+            self.core.ensure_open()
+        }
+    }
+
+    pub async fn get(&self, index: u64, opts: GetOptions) -> Result<Option<Bytes>> {
+        let mut closed = self.state.closed.subscribe();
+        self.ensure_open()?;
+        if *closed.borrow() {
+            return Err(CoreError::Closed);
+        }
+        tokio::select! {
+            result = self.core.get(index, opts) => result,
+            _ = closed.changed() => Err(CoreError::Closed),
+        }
+    }
+
+    pub async fn append<B: AsRef<[u8]>>(&self, blocks: &[B]) -> Result<Head> {
+        self.ensure_open()?;
+        self.core.append(blocks).await
+    }
+
+    pub async fn append_with<B: AsRef<[u8]>>(
+        &self,
+        blocks: &[B],
+        opts: AppendOptions,
+    ) -> Result<Head> {
+        self.ensure_open()?;
+        self.core.append_with(blocks, opts).await
+    }
+
+    pub fn get_local(&self, index: u64) -> Result<Option<Bytes>> {
+        self.ensure_open()?;
+        self.core.get_local(index)
+    }
+
+    pub fn get_raw_local(&self, index: u64) -> Result<Option<Bytes>> {
+        self.ensure_open()?;
+        self.core.get_raw_local(index)
+    }
+
+    pub async fn update(&self, timeout: Option<Duration>) -> Result<bool> {
+        self.ensure_open()?;
+        self.core.update(timeout).await
+    }
+
+    pub async fn seek(&self, bytes: u64, wait: bool) -> Result<Option<(u64, u64)>> {
+        self.ensure_open()?;
+        self.core.seek(bytes, wait).await
+    }
+
+    pub async fn truncate(&self, length: u64, fork: Option<u64>) -> Result<()> {
+        self.ensure_open()?;
+        self.core.truncate(length, fork).await
+    }
+
+    pub async fn clear(&self, start: u64, end: u64) -> Result<()> {
+        self.ensure_open()?;
+        self.core.clear(start, end).await
+    }
+
+    pub fn user_data(&self, key: &str) -> Result<Option<Bytes>> {
+        self.ensure_open()?;
+        self.core.user_data(key)
+    }
+
+    pub async fn set_user_data(&self, key: &str, value: Option<&[u8]>) -> Result<()> {
+        self.ensure_open()?;
+        self.core.set_user_data(key, value).await
+    }
+
     pub fn is_active(&self) -> bool {
-        self.active
+        self.state
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or(false)
     }
 
     pub fn set_active(&mut self, active: bool) {
-        if self.active == active {
+        let mut current = self.state.active.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(previous) = current.as_mut() else {
+            return;
+        };
+        if *previous == active {
             return;
         }
-        self.active = active;
+        *previous = active;
         if active {
             self.core
                 .inner
@@ -1424,26 +1833,49 @@ impl Session {
         }
         self.core.replicator().sync_active();
     }
-}
 
-impl std::ops::Deref for Session {
-    type Target = Core;
-    fn deref(&self) -> &Core {
-        &self.core
-    }
-}
-
-impl Drop for Session {
-    fn drop(&mut self) {
-        let inner = &self.core.inner;
-        inner.sessions.fetch_sub(1, Ordering::AcqRel);
-        if self.active {
-            inner.active_sessions.fetch_sub(1, Ordering::AcqRel);
-            if let Some(r) = inner.replicator.get() {
-                r.sync_active();
-            }
+    pub async fn acquire_exclusive(&self) -> Result<()> {
+        let mut closed = self.state.closed.subscribe();
+        if *closed.borrow() {
+            return Err(CoreError::Closed);
         }
-        self.core.check_if_idle();
+        let guard = tokio::select! {
+            guard = self.core.inner.exclusive.clone().lock_owned() => guard,
+            _ = closed.changed() => return Err(CoreError::Closed),
+        };
+        self.core.inner.leases.fetch_add(1, Ordering::AcqRel);
+        self.attach_exclusive(ExclusiveLease {
+            core: self.core.clone(),
+            _guard: guard,
+        })
+    }
+
+    pub fn take_exclusive(&self) -> Option<ExclusiveLease> {
+        self.state
+            .lease
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    pub fn attach_exclusive(&self, lease: ExclusiveLease) -> Result<()> {
+        let active = self.state.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active.is_none() {
+            return Err(CoreError::Closed);
+        }
+        if !Arc::ptr_eq(&lease.core.inner, &self.core.inner) {
+            return Err(CoreError::BadArgument(
+                "exclusive lease belongs to another core".into(),
+            ));
+        }
+        let mut slot = self.state.lease.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            return Err(CoreError::BadArgument(
+                "session already owns an exclusive lease".into(),
+            ));
+        }
+        *slot = Some(lease);
+        Ok(())
     }
 }
 
