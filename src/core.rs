@@ -136,12 +136,13 @@ impl<T> Drop for AbortOnDrop<T> {
 
 impl NodeStore for CoreStorage {
     fn node(&self, index: u64) -> merkle::Result<Option<compact_encoding::hypercore::Node>> {
-        self.tree_node(index)
+        self.get_tree_node(index)
             .map_err(|e| MerkleError::Storage(e.to_string()))
     }
 
     fn has_node(&self, index: u64) -> merkle::Result<bool> {
-        self.has_tree_node(index)
+        self.get_tree_node(index)
+            .map(|node| node.is_some())
             .map_err(|e| MerkleError::Storage(e.to_string()))
     }
 }
@@ -199,7 +200,8 @@ pub struct Head {
     pub byte_length: u64,
 }
 
-/// Persisted per-core metadata. Private format: only this crate reads it.
+/// The per-core metadata hypercore keeps in memory: the auth row, the head row
+/// and the hints row of the current data pointer.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Header {
     pub key: [u8; 32],
@@ -207,80 +209,91 @@ pub(crate) struct Header {
     pub secret_key: Option<[u8; 64]>,
     pub fork: u64,
     pub length: u64,
+    pub root_hash: [u8; 32],
     pub signature: Option<Bytes>,
+    pub timestamp: u64,
     pub contiguous_length: u64,
     pub remote_contiguous_length: u64,
     pub frozen: bool,
+    pub group: Option<[u8; 32]>,
+    pub encryption_key: Option<Bytes>,
 }
 
-const HEADER_VERSION: u64 = 1;
-
 impl Header {
-    fn encode(&self) -> Bytes {
-        let mut w = Writer::new();
-        w.uint(HEADER_VERSION);
-        let flags = self.manifest.is_some() as u64
-            | (self.secret_key.is_some() as u64) << 1
-            | (self.signature.is_some() as u64) << 2
-            | (self.frozen as u64) << 3;
-        w.uint(flags);
-        w.raw(&self.key);
-        if let Some(m) = &self.manifest {
-            m.encode(&mut w);
-        }
-        if let Some(s) = &self.secret_key {
-            w.raw(s);
-        }
-        w.uint(self.fork);
-        w.uint(self.length);
-        if let Some(s) = &self.signature {
-            w.buffer(s);
-        }
-        w.uint(self.contiguous_length);
-        w.uint(self.remote_contiguous_length);
-        w.finish()
+    /// Reads a core's rows; `None` when the core has no auth row.
+    pub(crate) fn load(storage: &CoreStorage) -> Result<Option<Self>> {
+        let Some(auth) = storage.get_auth()? else {
+            return Ok(None);
+        };
+        let head = storage.get_head()?.unwrap_or_default();
+        let hints = storage.get_hints()?.unwrap_or_default();
+        Ok(Some(Self {
+            key: auth.key,
+            manifest: auth.manifest,
+            secret_key: auth.key_pair.as_ref().and_then(|pair| pair.secret_key),
+            fork: head.fork,
+            length: head.length,
+            root_hash: head.root_hash,
+            signature: head.signature,
+            timestamp: head.timestamp,
+            contiguous_length: hints.contiguous_length,
+            remote_contiguous_length: hints.remote_contiguous_length,
+            frozen: hints.recovering != 0,
+            group: storage.get_group()?.and_then(|group| group.key),
+            encryption_key: auth.encryption_key,
+        }))
     }
 
-    fn decode(b: Bytes) -> Result<Self> {
-        let corrupt = |e: compact_encoding::Error| {
-            CoreError::Storage(StorageError::Corrupt(format!("header: {e}")))
-        };
-        let mut r = Reader::new(b);
-        if r.uint().map_err(corrupt)? != HEADER_VERSION {
-            return Err(CoreError::Storage(StorageError::Corrupt(
-                "unknown header version".into(),
-            )));
+    /// The `@core/auth` row this header stands for.
+    pub(crate) fn auth(&self) -> storage::Auth {
+        let key_pair = self.secret_key.map(|secret| {
+            let mut public_key = [0u8; 32];
+            public_key.copy_from_slice(&secret[32..]);
+            storage::KeyPair {
+                public_key,
+                secret_key: Some(secret),
+            }
+        });
+        storage::Auth {
+            key: self.key,
+            discovery_key: crypto::discovery_key(&self.key),
+            manifest: self.manifest.clone(),
+            key_pair,
+            encryption_key: self.encryption_key.clone(),
         }
-        let flags = r.uint().map_err(corrupt)?;
-        let key = r.fixed().map_err(corrupt)?;
-        let manifest = if flags & 1 != 0 {
-            Some(Manifest::decode(&mut r).map_err(corrupt)?)
-        } else {
-            None
-        };
-        let secret_key = if flags & 2 != 0 {
-            Some(r.fixed().map_err(corrupt)?)
-        } else {
-            None
-        };
-        let fork = r.uint().map_err(corrupt)?;
-        let length = r.uint().map_err(corrupt)?;
-        let signature = if flags & 4 != 0 {
-            Some(r.buffer().map_err(corrupt)?)
-        } else {
-            None
-        };
-        Ok(Self {
-            key,
-            manifest,
-            secret_key,
-            fork,
-            length,
-            signature,
-            contiguous_length: r.uint().map_err(corrupt)?,
-            remote_contiguous_length: r.uint().map_err(corrupt)?,
-            frozen: flags & 8 != 0,
-        })
+    }
+
+    /// The `@core/head` row for a tree with `roots`.
+    pub(crate) fn head_row(&self, roots: &[Node]) -> storage::CoreHead {
+        storage::CoreHead {
+            fork: self.fork,
+            length: self.length,
+            root_hash: crypto::tree_hash(roots),
+            signature: self.signature.clone(),
+            timestamp: now_millis(),
+        }
+    }
+
+    pub(crate) fn hints_row(&self) -> storage::HeaderHints {
+        storage::HeaderHints {
+            contiguous_length: self.contiguous_length,
+            remote_contiguous_length: self.remote_contiguous_length,
+            recovering: self.frozen as u64,
+        }
+    }
+
+    /// Queues the auth row (and the group row) when they changed.
+    pub(crate) fn write_auth(&self, tx: &mut storage::Batch) {
+        tx.set_auth(&self.auth());
+        if self.group.is_some() {
+            tx.set_group(self.group);
+        }
+    }
+
+    /// Queues the head and hints rows for a tree with `roots`.
+    pub(crate) fn write_head(&self, tx: &mut storage::Batch, roots: &[Node]) {
+        tx.set_head(&self.head_row(roots));
+        tx.set_hints(&self.hints_row());
     }
 
     fn key_pair(&self) -> Option<KeyPair> {
@@ -289,6 +302,13 @@ impl Header {
             KeyPair::from_seed(&seed)
         })
     }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 pub(crate) struct State {
@@ -448,19 +468,24 @@ impl Core {
                 ));
             }
         };
-        let storage = store.core(&crypto::discovery_key(&key));
-        let header = match storage.header()? {
-            Some(h) => {
-                let mut header = Header::decode(h)?;
+        let discovery_key = crypto::discovery_key(&key);
+        let (storage, header) = match store.resume_core(&discovery_key)? {
+            Some(storage) => {
+                let mut header = Header::load(&storage)?.ok_or(CoreError::NotFound)?;
                 if header.key != key {
                     return Err(CoreError::BadArgument(
                         "stored core has a different key".into(),
                     ));
                 }
-                if header.secret_key.is_none() {
-                    header.secret_key = opts.key_pair.as_ref().map(|kp| kp.secret_key);
+                if header.secret_key.is_none()
+                    && let Some(pair) = &opts.key_pair
+                {
+                    header.secret_key = Some(pair.secret_key);
+                    let mut tx = storage.write();
+                    header.write_auth(&mut tx);
+                    storage.flush(tx)?;
                 }
-                header
+                (storage, header)
             }
             None if opts.no_create => return Err(CoreError::NotFound),
             None => {
@@ -470,14 +495,20 @@ impl Core {
                 });
                 let header = Header {
                     key,
+                    manifest: manifest.clone(),
                     secret_key: opts.key_pair.as_ref().map(|kp| kp.secret_key),
-                    manifest,
+                    encryption_key: opts.encryption_key.map(Bytes::copy_from_slice),
                     ..Default::default()
                 };
-                let mut b = storage::Batch::default();
-                b.set_header(header.encode());
-                storage.write(b)?;
-                header
+                let storage = store.create_core(storage::CreateCore {
+                    key,
+                    discovery_key,
+                    manifest,
+                    key_pair: header.auth().key_pair,
+                    encryption_key: header.encryption_key.clone(),
+                    ..Default::default()
+                })?;
+                (storage, header)
             }
         };
         Self::from_header(store.clone(), storage, header, &opts)
@@ -489,8 +520,10 @@ impl Core {
         discovery_key: &[u8; 32],
         opts: CoreOptions,
     ) -> Result<Core> {
-        let storage = store.core(discovery_key);
-        let header = Header::decode(storage.header()?.ok_or(CoreError::NotFound)?)?;
+        let storage = store
+            .resume_core(discovery_key)?
+            .ok_or(CoreError::NotFound)?;
+        let header = Header::load(&storage)?.ok_or(CoreError::NotFound)?;
         Self::from_header(store.clone(), storage, header, &opts)
     }
 
@@ -559,11 +592,12 @@ impl Core {
     }
 
     pub fn stored_head(store: &Store, discovery_key: &[u8; 32]) -> Result<Option<Head>> {
-        let storage = store.core(discovery_key);
-        let Some(bytes) = storage.header()? else {
+        let Some(storage) = store.resume_core(discovery_key)? else {
             return Ok(None);
         };
-        let header = Header::decode(bytes)?;
+        let Some(header) = Header::load(&storage)? else {
+            return Ok(None);
+        };
         let roots = merkle::roots_at(&storage, header.length)?;
         Ok(Some(Head {
             fork: header.fork,
@@ -617,10 +651,10 @@ impl Core {
         if self.inner.storage.user_data(key)?.as_deref() == value {
             return Ok(());
         }
-        let mut batch = storage::Batch::default();
+        let mut batch = self.inner.storage.write();
         batch.put_user_data(key, value.map(Bytes::copy_from_slice));
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(batch)).await?;
+        blocking(move || storage.flush(batch)).await?;
         Ok(())
     }
 
@@ -755,7 +789,7 @@ impl Core {
         if !self.has(index) {
             return Ok(None);
         }
-        Ok(self.inner.storage.block(index)?)
+        Ok(self.inner.storage.get_block(index)?)
     }
 
     /// A block if stored locally, decrypted.
@@ -905,7 +939,7 @@ impl Core {
                 return Ok(st.head());
             }
             let mut batch = Batch::new(&st.tree);
-            let mut sb = storage::Batch::default();
+            let mut sb = self.inner.storage.write();
             for (i, b) in blocks.iter().enumerate() {
                 let index = start + i as u64;
                 let data = match &st.encryption {
@@ -943,11 +977,11 @@ impl Core {
             header.length = batch.length;
             header.signature = batch.signature.clone();
             header.contiguous_length = contig;
-            sb.set_header(header.encode());
+            header.write_head(&mut sb, &batch.roots);
             (batch, sb, start, end, contig)
         };
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         let head = {
             let mut st = self.state();
             st.tree = batch.state();
@@ -999,14 +1033,14 @@ impl Core {
             (batch, sb, st.tree.length)
         };
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         self.after_truncate(&batch, old);
         Ok(())
     }
 
     /// Storage writes for a truncation or reorg batch (`_truncate`).
     fn truncate_batch(&self, st: &State, batch: &mut Batch) -> storage::Batch {
-        let mut sb = storage::Batch::default();
+        let mut sb = self.inner.storage.write();
         sb.delete_block_range(batch.ancestors, batch.tree_length);
         write_tree_ops(batch, &mut sb);
         bitfield_pages(
@@ -1024,7 +1058,7 @@ impl Core {
             header.contiguous_length = batch.ancestors;
             header.remote_contiguous_length = batch.length.min(header.remote_contiguous_length);
         }
-        sb.set_header(header.encode());
+        header.write_head(&mut sb, &batch.roots);
         sb
     }
 
@@ -1061,7 +1095,7 @@ impl Core {
         let _w = self.inner.write.lock().await;
         let (sb, contig) = {
             let st = self.state();
-            let mut sb = storage::Batch::default();
+            let mut sb = self.inner.storage.write();
             let mut ite = Iter::new(start * 2);
             while !st.tree.roots.iter().any(|r| r.index == ite.index)
                 && ite.index < 2 * st.tree.length
@@ -1087,12 +1121,12 @@ impl Core {
             let contig = st.header.contiguous_length.min(start);
             let mut header = st.header.clone();
             header.contiguous_length = contig;
-            sb.set_header(header.encode());
+            header.write_head(&mut sb, &st.tree.roots);
             sb.delete_block_range(start, end);
             (sb, contig)
         };
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         {
             let mut st = self.state();
             st.header.contiguous_length = contig;
@@ -1217,7 +1251,7 @@ impl Core {
             b.value = self
                 .inner
                 .storage
-                .block(b.index)?
+                .get_block(b.index)?
                 .ok_or(CoreError::NotFound)?;
         }
         data.manifest = manifest;
@@ -1255,7 +1289,7 @@ impl Core {
                 })
             });
 
-            let mut sb = storage::Batch::default();
+            let mut sb = self.inner.storage.write();
             let block = proof.block.as_ref().map(|b| (b.index, b.value.clone()));
             let mut contig = st.header.contiguous_length;
             if let Some((index, value)) = &block {
@@ -1274,12 +1308,17 @@ impl Core {
                 header.signature = batch.signature.clone();
             }
             header.contiguous_length = contig;
-            sb.set_header(header.encode());
+            let roots = if batch.upgraded {
+                batch.roots.clone()
+            } else {
+                st.tree.roots.clone()
+            };
+            header.write_head(&mut sb, &roots);
             (batch, sb, block.map(|b| b.0), contig, learned)
         };
         let (batch, sb, block, contig, learned) = prepared;
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         let upgraded = batch.upgraded;
         {
             let mut st = self.state();
@@ -1313,7 +1352,7 @@ impl Core {
         let _w = self.inner.write.lock().await;
         let mut results = Vec::with_capacity(proofs.len());
         let mut indices = vec![];
-        let mut sb = storage::Batch::default();
+        let mut sb = self.inner.storage.write();
         let contig = {
             let st = self.state();
             for proof in proofs {
@@ -1362,19 +1401,19 @@ impl Core {
             }
             let mut header = st.header.clone();
             header.contiguous_length = c;
-            sb.set_header(header.encode());
+            header.write_head(&mut sb, &st.tree.roots);
             c
         };
         if indices.is_empty() {
             return results;
         }
         let storage = self.inner.storage.clone();
-        if let Err(e) = blocking(move || storage.write(sb)).await {
+        if let Err(e) = blocking(move || storage.flush(sb)).await {
             let msg = e.to_string();
             return results
                 .into_iter()
                 .map(|r| match r {
-                    Ok(Some(_)) => Err(CoreError::Storage(StorageError::Db(msg.clone()))),
+                    Ok(Some(_)) => Err(CoreError::Storage(StorageError::Rocks(msg.clone()))),
                     other => other,
                 })
                 .collect();
@@ -1422,7 +1461,7 @@ impl Core {
             (self.truncate_batch(&st, &mut batch), st.tree.length)
         };
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         self.after_truncate(&batch, old);
         Ok(true)
     }
@@ -1458,12 +1497,12 @@ impl Core {
         let sb = {
             let mut st = self.state();
             st.header.frozen = true;
-            let mut sb = storage::Batch::default();
-            sb.set_header(st.header.encode());
+            let mut sb = self.inner.storage.write();
+            st.header.write_head(&mut sb, &st.tree.roots);
             sb
         };
         let storage = self.inner.storage.clone();
-        blocking(move || storage.write(sb)).await?;
+        blocking(move || storage.flush(sb)).await?;
         Ok(true)
     }
 

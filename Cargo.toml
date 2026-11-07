@@ -16,9 +16,9 @@ blake2b_simd = "1"
 bytes = "1"
 compact-encoding-rs = { path = "../compact-encoding-rs" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+hypercore-storage-rs = { path = "../hypercore-storage-rs" }
 protomux-rs = { path = "../protomux-rs" }
 rand = "0.8"
-redb = "4"
 salsa20 = "0.10"
 tokio = { version = "1.40", features = ["sync", "rt", "macros", "time"] }
 

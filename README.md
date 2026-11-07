@@ -39,9 +39,11 @@ let block = reader.get(1, GetOptions::default()).await?;
 - `core`: append, get (local or from peers, with timeouts), update, download ranges, seek,
   truncate, clear, purge, and sessions. Inactive sessions do not keep downloads active; closing the
   last session shuts down its physical core once any detached exclusive lease is released.
-- `storage`: private to each peer. One redb database per directory holds headers, tree nodes,
-  bitfield pages and small blocks; blocks of 16 KiB or more go to append-only segment files (128
-  blocks per file), deleted once every block in them is cleared.
+- `storage`: npm `hypercore-storage`'s RockDB layout, read and written by
+  [`hypercore-storage-rs`](../hypercore-storage-rs): one `corestore` column family holds the store
+  head, the discovery-key index, aliases, groups, and per core the auth row, head, hints, every
+  block, tree node, bitfield page and user-data entry. A directory written by corestore 7.16.1 on
+  node can be opened here and the reverse, so both stacks can take turns on one directory.
 - `Core::events` exposes append, replicated download, truncation, peer and close notifications;
   `subscribe` remains available for head changes. User metadata is persisted with `set_user_data`,
   and `GetOptions::raw` returns stored ciphertext without decrypting.

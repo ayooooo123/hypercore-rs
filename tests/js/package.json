@@ -1,12 +1,16 @@
 {
   "name": "hypercore-rs-interop",
   "private": true,
-  "description": "npm hypercore peer driven by tests/replicate_js.rs",
+  "description": "npm hypercore/corestore peers driven by hypercore-rs tests",
   "dependencies": {
     "@hyperswarm/secret-stream": "6.9.2",
     "hypercore": "11.40.3",
     "hypercore-crypto": "3.7.0",
     "hyperdht": "6.36.0",
-    "hyperswarm": "4.17.2"
+    "hyperswarm": "4.17.2",
+    "corestore": "7.16.1",
+    "hyperbee2": "2.21.1",
+    "hypercore-storage": "3.4.0",
+    "b4a": "1.6.7"
   }
 }

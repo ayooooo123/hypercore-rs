@@ -312,7 +312,7 @@ async fn storage_close_stops_actors_and_invalidates_handles() {
         Err(CoreError::Closed)
     ));
     assert!(matches!(
-        core.storage().header(),
+        core.storage().get_head(),
         Err(hypercore::storage::StorageError::Closed)
     ));
     assert!(Store::open(dir.path()).is_ok());
