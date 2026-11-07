@@ -83,8 +83,8 @@ impl Bitfield {
             "bitfield page must be 4096 bytes"
         );
         let page = self.ensure_page(page_index);
-        for (word, chunk) in page.words.iter_mut().zip(bytes.chunks_exact(4)) {
-            *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (word, chunk) in page.words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *word = u32::from_le_bytes(*chunk);
         }
         page.dirty = false;
         if page.words.iter().all(|&w| w == 0) {
