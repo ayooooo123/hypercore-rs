@@ -50,7 +50,8 @@ let block = reader.get(1, GetOptions::default()).await?;
 - `RequestBag` cancels pending and subsequent reads with a sticky reason; pass it through
   `GetOptions::bag` or `download_with_bag`. Cancellation is scoped to that bag.
 - `Core::replicate` registers its Protomux pairer synchronously, so callers may mark the mux
-  ready immediately, including when the remote core open arrived during setup.
+  ready immediately, including when the remote core open arrived during setup. Closed cores
+  leave pairing to corestore so a stored core can be reopened on demand.
 
 Not ported: push mode, repair mode, protocol extensions, block-list ranges, sessions on named
 branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window of 48 is used).

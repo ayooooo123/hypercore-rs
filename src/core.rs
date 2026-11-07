@@ -781,13 +781,17 @@ impl Core {
 
     /// Replicates this core over a Protomux connection (one call per connection).
     pub fn replicate(&self, mux: &protomux::Mux) {
-        self.replicator().attach(mux, None);
+        if !self.is_closed() {
+            self.replicator().attach(mux, None);
+        }
     }
 
     /// Replicates over `mux` in answer to the remote open behind `pairing`
     /// (a Protomux pair request for this core's discovery key).
     pub fn replicate_paired(&self, mux: &protomux::Mux, pairing: protomux::PairRequest) {
-        self.replicator().attach(mux, Some(pairing));
+        if !self.is_closed() {
+            self.replicator().attach(mux, Some(pairing));
+        }
     }
 
     pub fn is_closed(&self) -> bool {

@@ -332,6 +332,24 @@ async fn replication_pairs_synchronously_before_mux_ready() {
     ));
     local.destroy();
     remote.destroy();
+
+    core.close();
+    let ((ar, aw), (br, bw)) = memory::duplex(64);
+    let remote = Mux::new(ar, aw, info(true));
+    let local = Mux::new(br, bw, info(false));
+    let mut requests = local.pair("hypercore/alpha", None);
+    core.replicate(&local);
+    local.ready();
+    let mut options = ChannelOptions::new("hypercore/alpha");
+    options.id = Some(core.discovery_key());
+    let _channel = remote.open_channel(options).unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), requests.recv())
+        .await
+        .expect("a closed core must leave discovery opens to corestore")
+        .unwrap();
+    core.replicate_paired(&local, request);
+    local.destroy();
+    remote.destroy();
 }
 
 #[tokio::test]
