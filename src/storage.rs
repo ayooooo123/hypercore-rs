@@ -6,6 +6,6 @@
 //! call sites keep their names (`Store`, `CoreStorage`, `Batch`, `StorageError`).
 
 pub use hypercore_storage::{
-    Alias, Auth, CoreHead, CoreStorage, CoreTx as Batch, CreateCore, Error as StorageError,
-    Hints as HeaderHints, InfoOptions, KeyPair, Node, Store,
+    Alias, Auth, CoreGroup, CoreHead, CoreStorage, CoreTx as Batch, CreateCore,
+    Error as StorageError, Hints as HeaderHints, InfoOptions, KeyPair, Node, Store,
 };

@@ -15,5 +15,6 @@ mod wants;
 
 pub use compact_encoding::hypercore::{Manifest, Node};
 pub use core::{
-    AppendOptions, Core, CoreError, CoreEvent, CoreOptions, GetOptions, Head, RequestBag, Session,
+    AppendOptions, Core, CoreError, CoreEvent, CoreOptions, GetOptions, GroupUpdate, Head,
+    RequestBag, Session,
 };

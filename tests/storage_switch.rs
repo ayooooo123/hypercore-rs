@@ -63,6 +63,9 @@ fn key_of(ledger: &Value, name: &str) -> [u8; 32] {
     hex_to_key(ledger["cores"][name]["key"].as_str().expect("core key"))
 }
 
+/// The group the `grouped` core joins (JS fixture `GROUP_TOPIC`).
+const GROUP_TOPIC: [u8; 32] = [0x77; 32];
+
 const CORES: &[(&str, bool)] = &[
     // name, appendable
     ("alpha", true),
@@ -90,6 +93,9 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
         };
         if *name == "secret" {
             options.encryption_key = Some(hex_to_key(ledger["encryptionKey"].as_str().unwrap()));
+        }
+        if *name == "grouped" {
+            options.group = Some(GROUP_TOPIC);
         }
         let view = match entry["namespace"].as_str() {
             Some(namespace) => store.namespace(namespace),
@@ -125,6 +131,9 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
             entry["signature"].as_str().map(str::to_string),
             "{name}: signature"
         );
+        if *name == "grouped" {
+            check_group(store, core, ledger);
+        }
         for sample in entry["sample"].as_array().unwrap() {
             let index = sample["index"].as_u64().unwrap();
             let value = core
@@ -141,6 +150,66 @@ async fn verify(store: &Corestore, ledger: &Value) -> Vec<(String, hypercore::Se
         out.push((name.to_string(), session));
     }
     out
+}
+
+/// The grouped core's log holds one row per member: its own head's key,
+/// timestamp and core pointer, as JS writes it.
+fn check_group(store: &Corestore, core: &hypercore::Core, ledger: &Value) {
+    let storage = core.storage();
+    let group = storage
+        .get_group()
+        .expect("group row")
+        .expect("the grouped core is in a group");
+    assert_eq!(group.key, Some(GROUP_TOPIC), "grouped: group topic");
+    assert_eq!(
+        Some(group.pointer),
+        store
+            .storage()
+            .get_group(&GROUP_TOPIC)
+            .expect("group pointer"),
+        "grouped: pointer in the store head"
+    );
+    let rows = store
+        .storage()
+        .group_updates(group.pointer, 0)
+        .expect("group rows");
+    let expected = ledger["groups"][hex(&GROUP_TOPIC)]
+        .as_array()
+        .unwrap_or_else(|| panic!("ledger has no group rows: {ledger}"));
+    assert_eq!(rows.len(), expected.len(), "grouped: group row count");
+    for (row, want) in rows.iter().rev().zip(expected) {
+        assert_eq!(
+            row.core_pointer,
+            want["ptr"].as_u64().unwrap(),
+            "grouped: row pointer"
+        );
+        assert_eq!(
+            hex(&row.key),
+            want["key"].as_str().unwrap(),
+            "grouped: row key"
+        );
+    }
+    let head = storage.get_head().expect("head").unwrap_or_default();
+    assert_eq!(
+        rows[0].timestamp, head.timestamp,
+        "grouped: the row is keyed by the head's timestamp"
+    );
+}
+
+/// Writes the group rows back into the ledger, as the JS fixture does.
+fn record_group(store: &Corestore, ledger: &mut Value) {
+    let Some(group) = store.storage().get_group(&GROUP_TOPIC).expect("group") else {
+        return;
+    };
+    let rows = store
+        .storage()
+        .group_updates(group, 0)
+        .expect("group rows")
+        .into_iter()
+        .rev()
+        .map(|row| json!({ "ptr": row.core_pointer, "key": hex(&row.key) }))
+        .collect::<Vec<_>>();
+    ledger["groups"] = json!({ hex(&GROUP_TOPIC): rows });
 }
 
 /// Reads, appends one block per appendable core, writes user data and a bee
@@ -222,6 +291,7 @@ async fn rust_turn(dir: &Path) -> usize {
         });
     }
 
+    record_group(&store, &mut ledger);
     store.close().await;
     write_ledger(dir, &ledger);
     cores.len()

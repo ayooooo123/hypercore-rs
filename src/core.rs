@@ -157,6 +157,8 @@ pub struct CoreOptions {
     pub encryption: EncryptionOptions,
     pub manifest_version: u64,
     pub inflight_range: Option<(u32, u32)>,
+    /// Join this topic's group (`core.setGroup` on open).
+    pub group: Option<[u8; 32]>,
     /// Fail with `NotFound` instead of creating the core.
     pub no_create: bool,
 }
@@ -171,6 +173,7 @@ impl Default for CoreOptions {
             encryption: EncryptionOptions::default(),
             manifest_version: 1,
             inflight_range: None,
+            group: None,
             no_create: false,
         }
     }
@@ -184,6 +187,14 @@ pub enum CoreEvent {
     PeerAdd,
     PeerRemove,
     Close,
+}
+
+/// One member's head, as `core.ongroupupdate(topic, update)` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupUpdate {
+    pub key: [u8; 32],
+    pub length: u64,
+    pub fork: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -210,10 +221,13 @@ pub(crate) struct Header {
     pub fork: u64,
     pub length: u64,
     pub signature: Option<Bytes>,
+    /// Epoch milliseconds of the head row this header stands for
+    /// (JS `core.header.tree.timestamp`); a group update row is keyed by it.
+    pub timestamp: u64,
     pub contiguous_length: u64,
     pub remote_contiguous_length: u64,
     pub frozen: bool,
-    pub group: Option<[u8; 32]>,
+    pub group: Option<storage::CoreGroup>,
     pub encryption_key: Option<Bytes>,
 }
 
@@ -232,10 +246,11 @@ impl Header {
             fork: head.fork,
             length: head.length,
             signature: head.signature,
+            timestamp: head.timestamp,
             contiguous_length: hints.contiguous_length,
             remote_contiguous_length: hints.remote_contiguous_length,
             frozen: hints.recovering != 0,
-            group: storage.get_group()?.and_then(|group| group.key),
+            group: storage.get_group()?,
             encryption_key: auth.encryption_key,
         }))
     }
@@ -259,14 +274,14 @@ impl Header {
         }
     }
 
-    /// The `@core/head` row for a tree with `roots`.
-    pub(crate) fn head_row(&self, roots: &[Node]) -> storage::CoreHead {
+    /// The `@core/head` row for a tree with `roots`, stamped `timestamp`.
+    fn head_row_at(&self, roots: &[Node], timestamp: u64) -> storage::CoreHead {
         storage::CoreHead {
             fork: self.fork,
             length: self.length,
             root_hash: crypto::tree_hash(roots),
             signature: self.signature.clone(),
-            timestamp: now_millis(),
+            timestamp,
         }
     }
 
@@ -286,10 +301,24 @@ impl Header {
         }
     }
 
-    /// Queues the head and hints rows for a tree with `roots`.
+    /// Queues the head and hints rows for a tree with `roots`, at the head
+    /// timestamp this core already has (JS writes no head row for a plain
+    /// download, a clear or a freeze).
     pub(crate) fn write_head(&self, tx: &mut storage::Batch, roots: &[Node]) {
-        tx.set_head(&self.head_row(roots));
+        tx.set_head(&self.head_row_at(roots, self.timestamp));
         tx.set_hints(&self.hints_row());
+    }
+
+    /// Queues the head and hints rows for a new head, and moves this core's
+    /// group update to it (`updateGroupIndex` + `setHead`).
+    pub(crate) fn write_new_head(&mut self, tx: &mut storage::Batch, roots: &[Node]) {
+        let previous = std::mem::replace(&mut self.timestamp, now_millis());
+        tx.set_head(&self.head_row_at(roots, self.timestamp));
+        tx.set_hints(&self.hints_row());
+        if let Some(group) = &self.group {
+            tx.delete_group_update(group.pointer, previous);
+            tx.put_group_update(group.pointer, self.timestamp, &self.key);
+        }
     }
 
     fn key_pair(&self) -> Option<KeyPair> {
@@ -413,6 +442,7 @@ fn bitfield_pages(
 }
 
 type IdleHook = Box<dyn Fn(&Core) + Send + Sync>;
+type GroupHook = Box<dyn Fn([u8; 32], GroupUpdate) + Send + Sync>;
 
 pub(crate) struct Inner {
     pub storage: CoreStorage,
@@ -434,6 +464,7 @@ pub(crate) struct Inner {
     manually_active: AtomicBool,
     peers: AtomicUsize,
     idle_hook: OnceLock<IdleHook>,
+    group_hook: OnceLock<GroupHook>,
 }
 
 /// A shared handle to one open core.
@@ -559,6 +590,25 @@ impl Core {
                 }
             }
         }
+        // `opts.group`: `core._open` joins the group and rewrites the row.
+        if let Some(topic) = opts.group {
+            let group = match state.header.group {
+                Some(group) if group.key == Some(topic) => group,
+                Some(_) => {
+                    return Err(CoreError::BadArgument(
+                        "core is already registered to another group".into(),
+                    ));
+                }
+                None => storage::CoreGroup {
+                    key: Some(topic),
+                    pointer: store.create_group(&topic)?,
+                },
+            };
+            state.header.group = Some(group);
+            let mut tx = storage.write();
+            tx.set_group(Some(group));
+            storage.flush(tx)?;
+        }
         let head = state.head();
         let core = Core {
             inner: Arc::new(Inner {
@@ -581,6 +631,7 @@ impl Core {
                 manually_active: AtomicBool::new(false),
                 peers: AtomicUsize::new(0),
                 idle_hook: OnceLock::new(),
+                group_hook: OnceLock::new(),
             }),
         };
         Ok(core)
@@ -938,7 +989,7 @@ impl Core {
     ) -> Result<Head> {
         let _w = self.inner.write.lock().await;
         self.ensure_open()?;
-        let (batch, sb, start, end, contig) = {
+        let (batch, sb, start, end, contig, stamp) = {
             let st = self.state();
             let kp = st.header.key_pair();
             let verifier = st.verifier.as_ref().ok_or(CoreError::NotWritable)?;
@@ -994,8 +1045,8 @@ impl Core {
             header.length = batch.length;
             header.signature = batch.signature.clone();
             header.contiguous_length = contig;
-            header.write_head(&mut sb, &batch.roots);
-            (batch, sb, start, end, contig)
+            header.write_new_head(&mut sb, &batch.roots);
+            (batch, sb, start, end, contig, header.timestamp)
         };
         let storage = self.inner.storage.clone();
         blocking(move || storage.flush(sb)).await?;
@@ -1004,12 +1055,14 @@ impl Core {
             st.tree = batch.state();
             st.header.length = batch.length;
             st.header.fork = batch.fork;
+            st.header.timestamp = stamp;
             st.header.signature = batch.signature.clone();
             st.header.contiguous_length = contig;
             st.set_bits(start, end, true);
             self.publish(&st);
             st.head()
         };
+        self.flush_hooks();
         let _ = self.inner.events.send(CoreEvent::Append {
             start,
             length: end - start,
@@ -1023,7 +1076,7 @@ impl Core {
     /// Truncates to `length`, moving to `fork` (default: current fork + 1).
     pub async fn truncate(&self, length: u64, fork: Option<u64>) -> Result<()> {
         let _w = self.inner.write.lock().await;
-        let (batch, sb, old) = {
+        let (batch, sb, old, stamp) = {
             let st = self.state();
             let kp = st.header.key_pair().ok_or(CoreError::NotWritable)?;
             let verifier = st.verifier.as_ref().ok_or(CoreError::NotWritable)?;
@@ -1046,17 +1099,17 @@ impl Core {
                 fork.unwrap_or(st.tree.fork + 1),
             )?;
             batch.signature = Some(verifier.sign(&batch, &kp).ok_or(CoreError::NotWritable)?);
-            let sb = self.truncate_batch(&st, &mut batch);
-            (batch, sb, st.tree.length)
+            let (sb, stamp) = self.truncate_batch(&st, &mut batch);
+            (batch, sb, st.tree.length, stamp)
         };
         let storage = self.inner.storage.clone();
         blocking(move || storage.flush(sb)).await?;
-        self.after_truncate(&batch, old);
+        self.after_truncate(&batch, old, stamp);
         Ok(())
     }
 
     /// Storage writes for a truncation or reorg batch (`_truncate`).
-    fn truncate_batch(&self, st: &State, batch: &mut Batch) -> storage::Batch {
+    fn truncate_batch(&self, st: &State, batch: &mut Batch) -> (storage::Batch, u64) {
         let mut sb = self.inner.storage.write();
         sb.delete_block_range(batch.ancestors, batch.tree_length);
         write_tree_ops(batch, &mut sb);
@@ -1075,17 +1128,18 @@ impl Core {
             header.contiguous_length = batch.ancestors;
             header.remote_contiguous_length = batch.length.min(header.remote_contiguous_length);
         }
-        header.write_head(&mut sb, &batch.roots);
-        sb
+        header.write_new_head(&mut sb, &batch.roots);
+        (sb, header.timestamp)
     }
 
-    fn after_truncate(&self, batch: &Batch, old_length: u64) {
+    fn after_truncate(&self, batch: &Batch, old_length: u64, stamp: u64) {
         let start = batch.ancestors;
         {
             let mut st = self.state();
             st.tree = batch.state();
             st.header.fork = batch.fork;
             st.header.length = batch.length;
+            st.header.timestamp = stamp;
             st.header.signature = batch.signature.clone();
             if start < st.header.contiguous_length {
                 st.header.contiguous_length = start;
@@ -1102,6 +1156,7 @@ impl Core {
         if let Some(r) = self.inner.replicator.get() {
             r.on_truncate(start, old_length.saturating_sub(start));
         }
+        self.flush_hooks();
     }
 
     /// Deletes local copies of blocks `[start, end)` (they stay in the log).
@@ -1110,7 +1165,7 @@ impl Core {
             return Ok(());
         }
         let _w = self.inner.write.lock().await;
-        let (sb, contig) = {
+        let (sb, contig, stamp) = {
             let st = self.state();
             let mut sb = self.inner.storage.write();
             let mut ite = Iter::new(start * 2);
@@ -1140,13 +1195,14 @@ impl Core {
             header.contiguous_length = contig;
             header.write_head(&mut sb, &st.tree.roots);
             sb.delete_block_range(start, end);
-            (sb, contig)
+            (sb, contig, header.timestamp)
         };
         let storage = self.inner.storage.clone();
         blocking(move || storage.flush(sb)).await?;
         {
             let mut st = self.state();
             st.header.contiguous_length = contig;
+            st.header.timestamp = stamp;
             st.set_bits(start, end, false);
         }
         if let Some(r) = self.inner.replicator.get() {
@@ -1228,6 +1284,66 @@ impl Core {
     /// uses it to garbage collect cores.
     pub fn set_idle_hook(&self, hook: impl Fn(&Core) + Send + Sync + 'static) {
         let _ = self.inner.idle_hook.set(Box::new(hook));
+    }
+
+    /// `core.ongroupupdate`: called with the group's topic and this core's head
+    /// after every commit that moves it, once the write is flushed.
+    pub fn set_group_update_hook(
+        &self,
+        hook: impl Fn([u8; 32], GroupUpdate) + Send + Sync + 'static,
+    ) {
+        let _ = self.inner.group_hook.set(Box::new(hook));
+    }
+
+    /// `_flushHooks`: tell the group this core's head moved.
+    fn flush_hooks(&self) {
+        let Some(hook) = self.inner.group_hook.get() else {
+            return;
+        };
+        let (topic, update) = {
+            let st = self.state();
+            let Some(topic) = st.header.group.and_then(|group| group.key) else {
+                return;
+            };
+            (
+                topic,
+                GroupUpdate {
+                    key: st.header.key,
+                    length: st.tree.length,
+                    fork: st.tree.fork,
+                },
+            )
+        };
+        hook(topic, update);
+    }
+
+    /// `core.setGroup(topic)`: joins the topic's group, refusing a second one.
+    pub async fn set_group(&self, topic: [u8; 32]) -> Result<()> {
+        let _w = self.inner.write.lock().await;
+        self.ensure_open()?;
+        if let Some(group) = self.state().header.group {
+            return if group.key == Some(topic) {
+                Ok(())
+            } else {
+                Err(CoreError::BadArgument(
+                    "core is already registered to another group".into(),
+                ))
+            };
+        }
+        let group = storage::CoreGroup {
+            key: Some(topic),
+            pointer: self.inner.store.create_group(&topic)?,
+        };
+        let tx = {
+            let mut st = self.state();
+            st.header.group = Some(group);
+            let mut tx = self.inner.storage.write();
+            tx.set_group(Some(group));
+            tx
+        };
+        let storage = self.inner.storage.clone();
+        blocking(move || storage.flush(tx)).await?;
+        Ok(())
     }
 
     pub(crate) fn set_peer_count(&self, n: usize) {
@@ -1331,10 +1447,21 @@ impl Core {
             } else {
                 st.tree.roots.clone()
             };
-            header.write_head(&mut sb, &roots);
-            (batch, sb, block.map(|b| b.0), contig, learned)
+            if batch.upgraded {
+                header.write_new_head(&mut sb, &roots);
+            } else {
+                header.write_head(&mut sb, &roots);
+            }
+            (
+                batch,
+                sb,
+                block.map(|b| b.0),
+                contig,
+                learned,
+                header.timestamp,
+            )
         };
-        let (batch, sb, block, contig, learned) = prepared;
+        let (batch, sb, block, contig, learned, stamp) = prepared;
         let storage = self.inner.storage.clone();
         blocking(move || storage.flush(sb)).await?;
         let upgraded = batch.upgraded;
@@ -1349,11 +1476,15 @@ impl Core {
                 st.header.length = batch.length;
                 st.header.signature = batch.signature.clone();
             }
+            st.header.timestamp = stamp;
             st.header.contiguous_length = contig;
             if let Some(i) = block {
                 st.set_bits(i, i + 1, true);
             }
             self.publish(&st);
+        }
+        if upgraded {
+            self.flush_hooks();
         }
         if let Some(block) = proof.block.as_ref() {
             let _ = self.inner.events.send(CoreEvent::Download {
@@ -1471,16 +1602,17 @@ impl Core {
     /// the remote tree.
     pub(crate) async fn apply_reorg(&self, mut batch: Batch) -> Result<bool> {
         let _w = self.inner.write.lock().await;
-        let (sb, old) = {
+        let (sb, old, stamp) = {
             let st = self.state();
             if !batch.commitable(&st.tree) {
                 return Ok(false);
             }
-            (self.truncate_batch(&st, &mut batch), st.tree.length)
+            let (sb, stamp) = self.truncate_batch(&st, &mut batch);
+            (sb, st.tree.length, stamp)
         };
         let storage = self.inner.storage.clone();
         blocking(move || storage.flush(sb)).await?;
-        self.after_truncate(&batch, old);
+        self.after_truncate(&batch, old, stamp);
         Ok(true)
     }
 
@@ -1818,6 +1950,11 @@ impl Session {
     ) -> Result<Head> {
         self.ensure_open()?;
         self.core.append_with(blocks, opts).await
+    }
+
+    pub async fn set_group(&self, topic: [u8; 32]) -> Result<()> {
+        self.ensure_open()?;
+        self.core.set_group(topic).await
     }
 
     pub fn get_local(&self, index: u64) -> Result<Option<Bytes>> {

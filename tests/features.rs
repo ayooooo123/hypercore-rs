@@ -317,3 +317,78 @@ async fn storage_close_stops_actors_and_invalidates_handles() {
     ));
     assert!(Store::open(dir.path()).is_ok());
 }
+
+#[tokio::test]
+async fn a_grouped_core_moves_its_group_row_to_each_new_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let topic = [0x77u8; 32];
+    let core = Core::open(
+        &store,
+        CoreOptions {
+            key_pair: Some(KeyPair::from_seed(&[9; 32])),
+            group: Some(topic),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.set_group_update_hook(move |topic, update| {
+        let _ = tx.send((topic, update));
+    });
+
+    let group = core.storage().get_group().unwrap().unwrap();
+    assert_eq!(group.key, Some(topic), "the core joined the group");
+    assert_eq!(group.pointer, store.get_group(&topic).unwrap().unwrap());
+
+    core.append(&[b"a"]).await.unwrap();
+    let (got, update) = rx.recv().await.unwrap();
+    assert_eq!(got, topic);
+    assert_eq!(
+        (update.key, update.length, update.fork),
+        (*core.key(), 1, 0),
+        "the hook reports the core and its new head"
+    );
+
+    core.append(&[b"b", b"c"]).await.unwrap();
+    assert_eq!(rx.recv().await.unwrap().1.length, 3, "batch append reports");
+    let head = core.storage().get_head().unwrap().unwrap();
+    let rows = store.group_updates(group.pointer, 0).unwrap();
+    assert_eq!(rows.len(), 1, "one row per member, moved not accumulated");
+    assert_eq!(
+        rows[0].timestamp, head.timestamp,
+        "keyed by the head timestamp"
+    );
+    assert_eq!(rows[0].core_pointer, core.storage().core_pointer());
+    assert_eq!(rows[0].key, *core.key());
+
+    core.truncate(1, None).await.unwrap();
+    let head = core.storage().get_head().unwrap().unwrap();
+    let rows = store.group_updates(group.pointer, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].timestamp, head.timestamp);
+    assert_eq!(rx.recv().await.unwrap().1.length, 1, "truncate reports too");
+
+    // setGroup refuses a second group and writes nothing the first time.
+    assert!(core.set_group([0x88; 32]).await.is_err());
+    assert_eq!(store.head().unwrap().groups, 1);
+
+    let solo = Core::open(
+        &store,
+        CoreOptions {
+            key_pair: Some(KeyPair::from_seed(&[10; 32])),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    solo.append(&[b"x"]).await.unwrap();
+    assert_eq!(store.head().unwrap().groups, 1, "no group row without one");
+    solo.set_group([0x88; 32]).await.unwrap();
+    solo.set_group([0x88; 32]).await.unwrap();
+    assert_eq!(store.head().unwrap().groups, 2, "joining allocates once");
+    solo.append(&[b"y"]).await.unwrap();
+    let pointer = store.get_group(&[0x88; 32]).unwrap().unwrap();
+    let rows = store.group_updates(pointer, 0).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, *solo.key());
+}

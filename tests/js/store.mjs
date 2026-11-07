@@ -10,6 +10,7 @@
 import Corestore from 'corestore'
 import Hypercore from 'hypercore'
 import Hyperbee from 'hyperbee2'
+import storageKeys from 'hypercore-storage/lib/keys.js'
 import crypto from 'hypercore-crypto'
 import b4a from 'b4a'
 import fs from 'fs'
@@ -24,6 +25,9 @@ const readLedger = () => JSON.parse(fs.readFileSync(ledgerPath, 'utf8'))
 const writeLedger = (ledger) => fs.writeFileSync(ledgerPath, JSON.stringify(ledger, null, 2))
 const hex = (buf) => (buf === null || buf === undefined ? null : b4a.toString(buf, 'hex'))
 const block = (fill, len = 32) => b4a.alloc(len, fill)
+
+// The group the `grouped` core joins; its rows are shared by every member.
+const GROUP_TOPIC = b4a.alloc(32, 0x77)
 
 const CORES = [
   { name: 'alpha', appendable: true },
@@ -75,6 +79,64 @@ async function describe(core, spec, extra = {}) {
   }
 }
 
+// `group.entry`'s key: uint tag, uint group, uint64be timestamp, uint pointer.
+function decodeGroupEntry(key) {
+  let i = 0
+  const uint = () => {
+    let n = 0
+    let shift = 0
+    for (;;) {
+      const byte = key[i++]
+      n += (byte & 0x7f) * 2 ** shift
+      if (!(byte & 0x80)) return n
+      shift += 7
+    }
+  }
+  uint()
+  uint()
+  const timestamp = Number(key.readBigUInt64BE(i))
+  i += 8
+  return { timestamp, ptr: uint() }
+}
+
+// Every row of a group's update log, oldest first.
+async function groupRows(store, topic) {
+  const group = await store.storage.getGroup(topic)
+  if (group === null) return []
+  const gte = storageKeys.group.entry(group, 0, 0)
+  const lt = storageKeys.group.entry(group + 1, 0, 0)
+  const rows = []
+  for await (const { key, value } of store.storage.db.iterator({ gte, lt })) {
+    rows.push({ ...decodeGroupEntry(key), key: hex(value) })
+  }
+  return rows
+}
+
+// The ledger keeps what both stacks must agree on; the timestamps are wall
+// clock, so only their position relative to the head is checked.
+async function describeGroup(store) {
+  return (await groupRows(store, GROUP_TOPIC)).map(({ ptr, key }) => ({ ptr, key }))
+}
+
+async function checkGroup(store, ledger, opened, problems) {
+  const expected = ledger.groups[hex(GROUP_TOPIC)] || []
+  const rows = await groupRows(store, GROUP_TOPIC)
+  if (rows.length !== expected.length) {
+    problems.push(`group: ${rows.length} rows != ${expected.length}`)
+  }
+  for (let i = 0; i < Math.min(rows.length, expected.length); i++) {
+    if (rows[i].ptr !== expected[i].ptr) problems.push(`group row ${i}: ptr`)
+    if (rows[i].key !== expected[i].key) problems.push(`group row ${i}: key`)
+  }
+  const grouped = opened.grouped
+  const head = grouped.core.header.tree
+  const own = rows.find((row) => row.key === hex(grouped.key))
+  if (!own) problems.push('group: the grouped core has no row')
+  else if (own.timestamp !== head.timestamp) {
+    problems.push(`group: row timestamp ${own.timestamp} != head ${head.timestamp}`)
+  }
+}
+
 async function build(dir) {
   const store = new Corestore(dir)
   await store.ready()
@@ -109,8 +171,7 @@ async function build(dir) {
   await v2.append(block(0x61))
   store.manifestVersion = 1
 
-  const groupKey = b4a.alloc(32, 0x77)
-  const grouped = store.get({ name: 'grouped', group: groupKey })
+  const grouped = store.get({ name: 'grouped', group: GROUP_TOPIC })
   await grouped.ready()
   await grouped.append(block(0x50))
   await grouped.append(block(0x51))
@@ -170,6 +231,7 @@ async function build(dir) {
     })
   }
   ledger.beeEntries = 4
+  ledger.groups = { [hex(GROUP_TOPIC)]: await describeGroup(store) }
   writeLedger(ledger)
   await closeAll(store, opened, bee)
   return ledger
@@ -200,6 +262,7 @@ async function open(store, ledger) {
       if (value !== sample.value) problems.push(`${spec.name}: block ${sample.index}`)
     }
   }
+  await checkGroup(store, ledger, opened, problems)
   return { opened, problems }
 }
 
@@ -241,6 +304,7 @@ async function switchDir(dir, writer) {
       ...(spec.namespace ? { namespace: spec.namespace } : {})
     })
   }
+  ledger.groups = { [hex(GROUP_TOPIC)]: await describeGroup(store) }
   writeLedger(ledger)
   await closeAll(store, opened, bee)
   return { cores: Object.keys(ledger.cores).length, problems: 0 }
