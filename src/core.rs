@@ -1309,6 +1309,14 @@ impl Core {
         self.replicator().pending_requests().await
     }
 
+    /// Wire requests outstanding across this core's peers (JS `sum(peer.inflight)`).
+    pub async fn inflight_requests(&self) -> usize {
+        match self.inner.replicator.get() {
+            Some(replicator) => replicator.inflight_requests().await,
+            None => 0,
+        }
+    }
+
     /// Called (once set) whenever the core may have become idle. Corestore
     /// uses it to garbage collect cores.
     pub fn set_idle_hook(&self, hook: impl Fn(&Core) + Send + Sync + 'static) {

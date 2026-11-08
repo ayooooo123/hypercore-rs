@@ -3,8 +3,8 @@
 //! events one at a time, as JS does on its event loop.
 //!
 //! Not ported: push mode (`allowPush`), repair mode, extensions, block-list
-//! ranges, the 40+ peer update throttle, and RTT-scaled inflight windows
-//! (without the UDX RTT the JS non-UDX window is used).
+//! ranges and the 40+ peer update throttle. UDX inflight windows use the
+//! mux's live RTT provider; other transports retain the JS non-UDX limit.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -158,6 +158,7 @@ enum Cmd {
     Destroy,
     /// Open block waiters, seeks and ranges: leak checks for range servers.
     Pending(oneshot::Sender<usize>),
+    Inflight(oneshot::Sender<usize>),
 }
 
 /// Handle to a core's replication actor.
@@ -325,6 +326,12 @@ impl Replicator {
     pub(crate) async fn pending_requests(&self) -> usize {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Pending(reply));
+        rx.await.unwrap_or(0)
+    }
+
+    pub(crate) async fn inflight_requests(&self) -> usize {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::Inflight(reply));
         rx.await.unwrap_or(0)
     }
 
@@ -545,14 +552,12 @@ impl Peer {
         !(self.paused || self.removed || frozen)
     }
 
-    fn max_inflight(&self) -> usize {
-        self.inflight_range
-            .1
-            .min(self.inflight_range.0.saturating_mul(3))
+    fn max_inflight(&self, peers: usize) -> usize {
+        inflight_window(self.inflight_range, self.mux.udx_rtt(), peers)
     }
 
-    fn max_hotswap_inflight(&self) -> usize {
-        16.max(self.max_inflight() / 2)
+    fn max_hotswap_inflight(&self, peers: usize) -> usize {
+        16.max(self.max_inflight(peers).div_ceil(2))
     }
 
     fn remote_has_block(&self, index: u64) -> bool {
@@ -614,6 +619,16 @@ fn remove_id(v: &mut Vec<ReqId>, id: ReqId) -> bool {
         }
         None => false,
     }
+}
+
+fn inflight_window((min, max): (usize, usize), rtt: Option<u32>, peers: usize) -> usize {
+    let Some(rtt) = rtt else { return max.min(min.saturating_mul(3)) };
+    let scale = if rtt <= 50 {
+        1.0
+    } else {
+        f64::from(rtt) / 50.0 * (2.0 / peers.max(1) as f64).min(1.0)
+    };
+    min.max((max as f64).min(min as f64 * scale).round() as usize)
 }
 
 impl Actor {
@@ -724,6 +739,9 @@ impl Actor {
             Cmd::Pending(reply) => {
                 let waiters: usize = self.blocks.values().map(|b| b.waiters.len()).sum();
                 let _ = reply.send(waiters + self.seeks.len() + self.ranges.len());
+            }
+            Cmd::Inflight(reply) => {
+                let _ = reply.send(self.peers.iter().flatten().map(|peer| peer.inflight).sum());
             }
             Cmd::Attach(mux, requests, pairing) => {
                 self.attach(core, mux, requests);
@@ -2997,7 +3015,7 @@ impl Actor {
     fn update_hotswap(&mut self, core: &Core, id: PeerId) {
         let frozen = Self::frozen(core);
         let Some(p) = self.peer(id) else { return };
-        let max = p.max_hotswap_inflight();
+        let max = p.max_hotswap_inflight(self.order.len());
         if !p.is_active(frozen) || p.inflight >= max {
             return;
         }
@@ -3053,7 +3071,7 @@ impl Actor {
     fn update_peer_primary(&mut self, core: &Core, id: PeerId) -> bool {
         let frozen = Self::frozen(core);
         let Some(p) = self.peer(id) else { return false };
-        if !p.is_active(frozen) || p.inflight >= p.max_inflight() || !p.remote_uploading {
+        if !p.is_active(frozen) || p.inflight >= p.max_inflight(self.order.len()) || !p.remote_uploading {
             return false;
         }
         if core.manifest().is_none()
@@ -3092,7 +3110,7 @@ impl Actor {
     fn update_peer_non_primary(&mut self, core: &Core, id: PeerId) -> bool {
         let frozen = Self::frozen(core);
         let Some(p) = self.peer(id) else { return false };
-        if !p.is_active(frozen) || p.inflight >= p.max_inflight() || !p.remote_uploading {
+        if !p.is_active(frozen) || p.inflight >= p.max_inflight(self.order.len()) || !p.remote_uploading {
             return false;
         }
         let mut order: Vec<usize> = (0..self.ranges.len()).collect();
@@ -3267,6 +3285,50 @@ fn is_plain_block(d: &Data, fork: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn udx_inflight_window_matches_js_latency_and_peer_scaling() {
+        assert_eq!(inflight_window((16, 512), None, 1), 48);
+        assert_eq!(inflight_window((16, 512), Some(0), 1), 16);
+        assert_eq!(inflight_window((16, 512), Some(50), 1), 16);
+        assert_eq!(inflight_window((16, 512), Some(55), 1), 18);
+        assert_eq!(inflight_window((16, 512), Some(75), 1), 24);
+        assert_eq!(inflight_window((16, 512), Some(200), 4), 32);
+        assert_eq!(inflight_window((16, 512), Some(100), 8), 16);
+        assert_eq!(inflight_window((16, 512), Some(2000), 1), 512);
+        assert_eq!(inflight_window((12, 32), Some(200), 1), 32);
+        assert_eq!(inflight_window((16, 48), Some(110), 1), 35);
+    }
+
+    #[tokio::test]
+    async fn inflight_snapshot_sums_live_peer_wire_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(dir.path()).unwrap();
+        let core = Core::open(&store, crate::CoreOptions {
+            key_pair: Some(crate::crypto::KeyPair::from_seed(&[20; 32])),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(core.inflight_requests().await, 0);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut actor = Actor::new(Arc::downgrade(&core.inner), *core.discovery_key(), tx);
+        let ((ar, aw), (br, bw)) = protomux::memory::duplex(16);
+        let info = protomux::StreamInfo { handshake_hash: Some([7; 64]), ..Default::default() };
+        let a = Mux::new(ar, aw, info.clone());
+        let b = Mux::new(br, bw, info);
+        assert!(actor.make_peer(&core, &a));
+        assert!(actor.make_peer(&core, &b));
+        actor.peers[0].as_mut().unwrap().inflight = 3;
+        actor.peers[1].as_mut().unwrap().inflight = 5;
+        let (reply, result) = oneshot::channel();
+        actor.handle(&core, Cmd::Inflight(reply)).await;
+        assert_eq!(result.await.unwrap(), 8);
+        actor.peers[0] = None;
+        let (reply, result) = oneshot::channel();
+        actor.handle(&core, Cmd::Inflight(reply)).await;
+        assert_eq!(result.await.unwrap(), 5);
+        a.destroy();
+        b.destroy();
+    }
 
     #[tokio::test]
     async fn closed_replicator_cannot_replace_a_corestore_pairer() {

@@ -36,6 +36,8 @@ let block = reader.get(1, GetOptions::default()).await?;
   seeks, reorgs and conflict detection. Block takeover follows the hotswap rule: a busy peer only
   re-requests a block once it has been in flight three times that peer's block round trip; an idle
   peer takes any.
+  `Core::inflight_requests().await` snapshots outstanding wire requests across live peers
+  without counting queued ranges or adding per-block atomics.
 - `core`: append, get (local or from peers, with timeouts), update, download ranges, seek,
   truncate, clear, purge, and sessions. Inactive sessions do not keep downloads active; closing the
   last session shuts down its physical core once any detached exclusive lease is released.
@@ -56,7 +58,9 @@ let block = reader.get(1, GetOptions::default()).await?;
   leave pairing to corestore so a stored core can be reopened on demand.
 
 Not ported: push mode, repair mode, protocol extensions, block-list ranges, sessions on named
-branches/snapshots/atoms, and RTT-scaled inflight windows (the JS non-UDX window of 48 is used).
+branches/snapshots/atoms. Hosts attach live UDX RTT with `Mux::set_udx_rtt` before replication:
+the request window then uses JS's 50 ms latency scaling and live peer-count factor,
+bounded by the configured range. Other transports retain the JS non-UDX limit.
 
 ## Compatibility
 
