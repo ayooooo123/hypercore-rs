@@ -47,7 +47,10 @@ unsafe impl GlobalAlloc for Allocator {
 static ALLOCATOR: Allocator = Allocator;
 
 fn main() {
-    let args: Vec<usize> = std::env::args().skip(1).map(|s| s.parse().unwrap()).collect();
+    let args: Vec<usize> = std::env::args()
+        .skip(1)
+        .map(|s| s.parse().unwrap())
+        .collect();
     let [cores, blocks, connections, workers] = args.as_slice() else {
         panic!("expected cores blocks connections workers");
     };
@@ -68,14 +71,20 @@ async fn run(cores: usize, blocks: usize, connections: usize, workers: usize) {
     let mut readers = Vec::new();
     let baseline = LIVE.load(Ordering::Relaxed);
     for i in 0..cores {
-        let writer = source.get(GetOptions::name(format!("core-{i}"))).await.unwrap();
+        let writer = source
+            .get(GetOptions::name(format!("core-{i}")))
+            .await
+            .unwrap();
         for start in (0..blocks).step_by(64) {
             let values: Vec<_> = (start..blocks.min(start + 64))
                 .map(|index| vec![(index % 251) as u8; 1024])
                 .collect();
             writer.append(&values).await.unwrap();
         }
-        let reader = destination.get(GetOptions::key(*writer.key())).await.unwrap();
+        let reader = destination
+            .get(GetOptions::key(*writer.key()))
+            .await
+            .unwrap();
         writers.push(writer);
         readers.push(reader);
     }
@@ -87,12 +96,24 @@ async fn run(cores: usize, blocks: usize, connections: usize, workers: usize) {
     if blocks > 0 {
         for _ in 0..connections {
             let ((ar, aw), (br, bw)) = memory::duplex(64);
-            let a = Mux::new(ar, aw, StreamInfo {
-                is_initiator: true, handshake_hash: Some([7; 64]), remote_public_key: None,
-            });
-            let b = Mux::new(br, bw, StreamInfo {
-                is_initiator: false, handshake_hash: Some([7; 64]), remote_public_key: None,
-            });
+            let a = Mux::new(
+                ar,
+                aw,
+                StreamInfo {
+                    is_initiator: true,
+                    handshake_hash: Some([7; 64]),
+                    remote_public_key: None,
+                },
+            );
+            let b = Mux::new(
+                br,
+                bw,
+                StreamInfo {
+                    is_initiator: false,
+                    handshake_hash: Some([7; 64]),
+                    remote_public_key: None,
+                },
+            );
             source.replicate(&a);
             destination.replicate(&b);
             muxes.extend([a, b]);
@@ -107,20 +128,38 @@ async fn run(cores: usize, blocks: usize, connections: usize, workers: usize) {
             });
         }
         tokio::time::timeout(Duration::from_secs(300), async {
-            while let Some(result) = tasks.join_next().await { result.unwrap(); }
-        }).await.expect("multi-core download timed out");
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("multi-core download timed out");
     }
-    println!("cores={cores} blocks={blocks} connections={connections} workers={workers} wall_s={:.6} idle_rust_bytes={idle} peak_rust_bytes={} replication_allocs={}",
-        started.elapsed().as_secs_f64(), PEAK.load(Ordering::Relaxed),
-        ALLOCS.load(Ordering::Relaxed) - allocations);
+    println!(
+        "cores={cores} blocks={blocks} connections={connections} workers={workers} wall_s={:.6} idle_rust_bytes={idle} peak_rust_bytes={} replication_allocs={}",
+        started.elapsed().as_secs_f64(),
+        PEAK.load(Ordering::Relaxed),
+        ALLOCS.load(Ordering::Relaxed) - allocations
+    );
     for reader in &readers {
         for index in 0..blocks {
-            let value = reader.get(index as u64, BlockOptions { wait: false, ..Default::default() })
-                .await.unwrap().unwrap();
+            let value = reader
+                .get(
+                    index as u64,
+                    BlockOptions {
+                        wait: false,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(value.as_ref(), vec![(index % 251) as u8; 1024]);
         }
     }
-    for mux in muxes { mux.destroy(); }
+    for mux in muxes {
+        mux.destroy();
+    }
     source.close().await;
     destination.close().await;
 }

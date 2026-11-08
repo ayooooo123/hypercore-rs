@@ -622,7 +622,9 @@ fn remove_id(v: &mut Vec<ReqId>, id: ReqId) -> bool {
 }
 
 fn inflight_window((min, max): (usize, usize), rtt: Option<u32>, peers: usize) -> usize {
-    let Some(rtt) = rtt else { return max.min(min.saturating_mul(3)) };
+    let Some(rtt) = rtt else {
+        return max.min(min.saturating_mul(3));
+    };
     let scale = if rtt <= 50 {
         1.0
     } else {
@@ -3071,7 +3073,10 @@ impl Actor {
     fn update_peer_primary(&mut self, core: &Core, id: PeerId) -> bool {
         let frozen = Self::frozen(core);
         let Some(p) = self.peer(id) else { return false };
-        if !p.is_active(frozen) || p.inflight >= p.max_inflight(self.order.len()) || !p.remote_uploading {
+        if !p.is_active(frozen)
+            || p.inflight >= p.max_inflight(self.order.len())
+            || !p.remote_uploading
+        {
             return false;
         }
         if core.manifest().is_none()
@@ -3110,7 +3115,10 @@ impl Actor {
     fn update_peer_non_primary(&mut self, core: &Core, id: PeerId) -> bool {
         let frozen = Self::frozen(core);
         let Some(p) = self.peer(id) else { return false };
-        if !p.is_active(frozen) || p.inflight >= p.max_inflight(self.order.len()) || !p.remote_uploading {
+        if !p.is_active(frozen)
+            || p.inflight >= p.max_inflight(self.order.len())
+            || !p.remote_uploading
+        {
             return false;
         }
         let mut order: Vec<usize> = (0..self.ranges.len()).collect();
@@ -3304,15 +3312,22 @@ mod tests {
     async fn inflight_snapshot_sums_live_peer_wire_requests() {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::storage::Store::open(dir.path()).unwrap();
-        let core = Core::open(&store, crate::CoreOptions {
-            key_pair: Some(crate::crypto::KeyPair::from_seed(&[20; 32])),
-            ..Default::default()
-        }).unwrap();
+        let core = Core::open(
+            &store,
+            crate::CoreOptions {
+                key_pair: Some(crate::crypto::KeyPair::from_seed(&[20; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(core.inflight_requests().await, 0);
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut actor = Actor::new(Arc::downgrade(&core.inner), *core.discovery_key(), tx);
         let ((ar, aw), (br, bw)) = protomux::memory::duplex(16);
-        let info = protomux::StreamInfo { handshake_hash: Some([7; 64]), ..Default::default() };
+        let info = protomux::StreamInfo {
+            handshake_hash: Some([7; 64]),
+            ..Default::default()
+        };
         let a = Mux::new(ar, aw, info.clone());
         let b = Mux::new(br, bw, info);
         assert!(actor.make_peer(&core, &a));
