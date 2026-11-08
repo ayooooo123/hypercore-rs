@@ -381,7 +381,7 @@ impl State {
 
     fn set_bits(&mut self, start: u64, end: u64, value: bool) {
         self.bitfield.set_range(start, end, value);
-        self.bitfield.take_dirty();
+        self.bitfield.clear_dirty();
     }
 
     fn set_manifest(&mut self, manifest: Manifest) {
@@ -457,7 +457,7 @@ pub(crate) struct Inner {
     write: tokio::sync::Mutex<()>,
     exclusive: Arc<tokio::sync::Mutex<()>>,
     head: watch::Sender<Head>,
-    events: broadcast::Sender<CoreEvent>,
+    events: OnceLock<broadcast::Sender<CoreEvent>>,
     closed: AtomicBool,
     pub(crate) inflight_range: Mutex<Option<(u32, u32)>>,
     pub replicator: OnceLock<Replicator>,
@@ -624,7 +624,7 @@ impl Core {
                 write: tokio::sync::Mutex::new(()),
                 exclusive: Arc::new(tokio::sync::Mutex::new(())),
                 head: watch::channel(head).0,
-                events: broadcast::channel(256).0,
+                events: OnceLock::new(),
                 closed: AtomicBool::new(false),
                 inflight_range: Mutex::new(opts.inflight_range),
                 replicator: OnceLock::new(),
@@ -777,7 +777,16 @@ impl Core {
     }
 
     pub fn events(&self) -> broadcast::Receiver<CoreEvent> {
-        self.inner.events.subscribe()
+        self.inner
+            .events
+            .get_or_init(|| broadcast::channel(256).0)
+            .subscribe()
+    }
+
+    fn emit(&self, event: CoreEvent) {
+        if let Some(events) = self.inner.events.get() {
+            let _ = events.send(event);
+        }
     }
 
     fn ensure_open(&self) -> Result<()> {
@@ -812,7 +821,7 @@ impl Core {
         if self.inner.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.inner.events.send(CoreEvent::Close);
+        self.emit(CoreEvent::Close);
         if let Some(r) = self.inner.replicator.get() {
             r.destroy();
         }
@@ -1083,7 +1092,7 @@ impl Core {
             st.head()
         };
         self.flush_hooks();
-        let _ = self.inner.events.send(CoreEvent::Append {
+        self.emit(CoreEvent::Append {
             start,
             length: end - start,
         });
@@ -1169,7 +1178,7 @@ impl Core {
             st.set_bits(start, old_length.max(start), false);
             self.publish(&st);
         }
-        let _ = self.inner.events.send(CoreEvent::Truncate {
+        self.emit(CoreEvent::Truncate {
             fork: batch.fork,
             length: batch.length,
         });
@@ -1374,7 +1383,7 @@ impl Core {
             CoreEvent::PeerRemove
         };
         for _ in 0..old.abs_diff(n) {
-            let _ = self.inner.events.send(event.clone());
+            self.emit(event.clone());
         }
     }
 
@@ -1507,7 +1516,7 @@ impl Core {
             self.flush_hooks();
         }
         if let Some(block) = proof.block.as_ref() {
-            let _ = self.inner.events.send(CoreEvent::Download {
+            self.emit(CoreEvent::Download {
                 index: block.index,
                 byte_length: block.value.len() as u64,
             });
@@ -1603,7 +1612,7 @@ impl Core {
             if matches!(result, Ok(Some(_)))
                 && let Some(block) = &proof.block
             {
-                let _ = self.inner.events.send(CoreEvent::Download {
+                self.emit(CoreEvent::Download {
                     index: block.index,
                     byte_length: block.value.len() as u64,
                 });
@@ -2117,10 +2126,18 @@ mod feature_tests {
         )
         .unwrap();
         core.append(&[b"a", b"b"]).await.unwrap();
+        assert!(core.inner.events.get().is_none());
+        let mut events = core.events();
         core.set_remote_contiguous_length(10);
         assert_eq!(core.remote_contiguous_length(), 2);
         core.truncate(1, None).await.unwrap();
         assert_eq!(core.remote_contiguous_length(), 1);
+        assert_eq!(
+            events.try_recv().unwrap(),
+            CoreEvent::Truncate { fork: 1, length: 1 }
+        );
+        core.close();
+        assert_eq!(events.try_recv().unwrap(), CoreEvent::Close);
     }
 
     #[tokio::test]

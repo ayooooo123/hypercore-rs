@@ -394,6 +394,17 @@ impl Bitfield {
         }
     }
 
+    /// Marks persisted pages clean without encoding them again.
+    pub(crate) fn clear_dirty(&mut self) {
+        self.pages.retain(|_, page| {
+            if !page.dirty {
+                return true;
+            }
+            page.dirty = false;
+            page.words.iter().any(|&word| word != 0)
+        });
+    }
+
     /// Returns pages changed since the previous call, sorted by page index.
     /// `None` means the page is all zero and can be deleted.
     pub fn take_dirty(&mut self) -> Vec<(u64, Option<Vec<u8>>)> {
@@ -686,6 +697,21 @@ mod tests {
         assert_eq!(dirty, vec![(0, None)]);
         assert!(bitfield.pages.is_empty(), "all-zero page is dropped");
         assert!(!bitfield.get(0));
+    }
+
+    #[test]
+    fn clear_dirty_matches_taking_dirty_without_encoding_pages() {
+        let mut bitfield = Bitfield::new();
+        bitfield.set_range(0, BITS_PER_PAGE + 1, true);
+        bitfield.clear_dirty();
+        assert!(bitfield.take_dirty().is_empty());
+        assert!(bitfield.get(BITS_PER_PAGE));
+        bitfield.set_range(0, BITS_PER_PAGE, false);
+        bitfield.clear_dirty();
+        assert!(bitfield.page_words(0).is_none());
+        assert!(bitfield.get(BITS_PER_PAGE));
+        assert!(bitfield.take_dirty().is_empty());
+        assert_eq!(bitfield.segments[&0], INITIAL_WORDS_PER_SEGMENT * 4);
     }
 
     #[test]
