@@ -2145,8 +2145,14 @@ mod feature_tests {
                 .await
                 .unwrap();
             source.flush().unwrap();
-            let cache =
-                Store::open_with_options(&root.join("cache"), StoreOptions { wal: false }).unwrap();
+            let cache = Store::open_with_options(
+                &root.join("cache"),
+                StoreOptions {
+                    wal: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
             let reader = Core::open(
                 &cache,
                 CoreOptions {
