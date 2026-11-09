@@ -7,5 +7,5 @@
 
 pub use hypercore_storage::{
     Alias, Auth, CoreGroup, CoreHead, CoreStorage, CoreTx as Batch, CreateCore,
-    Error as StorageError, Hints as HeaderHints, InfoOptions, KeyPair, Node, Store,
+    Error as StorageError, Hints as HeaderHints, InfoOptions, KeyPair, Node, Store, StoreOptions,
 };

@@ -2122,6 +2122,151 @@ mod feature_tests {
     use super::*;
 
     #[tokio::test]
+    async fn rebuildable_cache_loses_only_complete_unflushed_batches() {
+        use crate::storage::StoreOptions;
+        use compact_encoding::hypercore::{RequestBlock, RequestUpgrade};
+        let values = (0..64)
+            .map(|i| vec![i as u8; 512 * 1024])
+            .collect::<Vec<_>>();
+        if let Some(root) = std::env::var_os("WAL_FREE_CRASH_STORE") {
+            let root = std::path::PathBuf::from(root);
+            let source = Store::open(&root.join("source")).unwrap();
+            let writer = Core::open(
+                &source,
+                CoreOptions {
+                    key_pair: Some(KeyPair::from_seed(&[23; 32])),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            std::fs::write(root.join("key"), writer.key()).unwrap();
+            writer
+                .append(&values.iter().map(Vec::as_slice).collect::<Vec<_>>())
+                .await
+                .unwrap();
+            source.flush().unwrap();
+            let cache =
+                Store::open_with_options(&root.join("cache"), StoreOptions { wal: false }).unwrap();
+            let reader = Core::open(
+                &cache,
+                CoreOptions {
+                    key: Some(*writer.key()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let upgrade = writer
+                .proof_for(
+                    &ProofRequest {
+                        upgrade: Some(RequestUpgrade {
+                            start: 0,
+                            length: 64,
+                        }),
+                        ..Default::default()
+                    },
+                    true,
+                )
+                .unwrap();
+            reader.verify(upgrade).await.unwrap();
+            let proof = |index| {
+                writer
+                    .proof_for(
+                        &ProofRequest {
+                            block: Some(RequestBlock { index, nodes: 6 }),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                    .unwrap()
+            };
+            let results = reader
+                .verify_blocks(&(0..56).map(proof).collect::<Vec<_>>())
+                .await;
+            assert!(results.into_iter().all(|r| matches!(r, Ok(Some(false)))));
+            cache.flush().unwrap();
+            let results = reader
+                .verify_blocks(&(56..64).map(proof).collect::<Vec<_>>())
+                .await;
+            assert!(results.into_iter().all(|r| matches!(r, Ok(Some(false)))));
+            // No destructors: RocksDB's normal close would flush a WAL-free memtable.
+            std::process::exit(0);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "core::feature_tests::rebuildable_cache_loses_only_complete_unflushed_batches",
+            ])
+            .env("WAL_FREE_CRASH_STORE", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success(), "cache writer failed");
+        let key = std::fs::read(dir.path().join("key"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let cache_dir = dir.path().join("cache");
+        let cache = Store::open(&cache_dir).unwrap();
+        let reader = Core::open(
+            &cache,
+            CoreOptions {
+                key: Some(key),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            reader.has_range(0, 56),
+            "the flushed checkpoint must survive"
+        );
+        assert!(!reader.has(63), "exercise an actually lost WAL-free tail");
+        let verifier_store = Store::open(&dir.path().join("verifier")).unwrap();
+        let verifier = Core::open(
+            &verifier_store,
+            CoreOptions {
+                key: Some(key),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        verifier
+            .verify(
+                reader
+                    .proof_for(
+                        &ProofRequest {
+                            upgrade: Some(RequestUpgrade {
+                                start: 0,
+                                length: reader.length(),
+                            }),
+                            ..Default::default()
+                        },
+                        true,
+                    )
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        for index in 0..reader.length() {
+            if reader.has(index) {
+                let proof = reader
+                    .proof_for(
+                        &ProofRequest {
+                            block: Some(RequestBlock { index, nodes: 6 }),
+                            ..Default::default()
+                        },
+                        false,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    proof.block.as_ref().unwrap().value.as_ref(),
+                    values[index as usize]
+                );
+                assert_eq!(verifier.verify(proof).await.unwrap(), Some(false));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn remote_contiguous_hint_is_capped_at_local_length() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();

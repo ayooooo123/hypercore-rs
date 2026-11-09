@@ -84,6 +84,9 @@ bounded by the configured range. Other transports retain the JS non-UDX limit.
   user data, and comparing every core's length, tree and blocks. `tests/storage_crash.rs` kills a
   writer mid-append and checks the directory still opens on both sides. Neither stack has a private
   format: the directory is the interchange format.
+  The WAL-free cache regression exits a subprocess without destructors after a
+  flushed checkpoint and an unflushed batch. Reopening loses only the tail; every
+  block still advertised locally verifies against its signed Merkle tree.
 - `tests/replicate_js.rs`: the same over secret-stream on TCP, plus an encrypted JS core and a JS
   truncation (reorg). A fast regression check that doesn't involve the DHT.
 - `cargo run --release --example crypto_bench` measures the per-block crypto. On an Apple M-series
