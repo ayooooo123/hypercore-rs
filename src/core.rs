@@ -848,6 +848,14 @@ impl Core {
         start >= end || !self.state().bitfield.has_unset(start, end - start)
     }
 
+    /// How many blocks of `[start, end)` are stored locally (`core.count()`), under one lock.
+    pub fn count_local(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        self.state().bitfield.count(start, end - start, true)
+    }
+
     fn publish(&self, st: &State) {
         self.inner.head.send_replace(st.head());
     }
@@ -1891,6 +1899,9 @@ impl Session {
     }
     pub fn has_range(&self, start: u64, end: u64) -> bool {
         self.core.has_range(start, end)
+    }
+    pub fn count_local(&self, start: u64, end: u64) -> u64 {
+        self.core.count_local(start, end)
     }
     pub fn byte_range(&self, index: u64) -> Result<(u64, u64)> {
         self.ensure_open()?;
