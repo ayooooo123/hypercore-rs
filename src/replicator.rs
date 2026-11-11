@@ -159,6 +159,8 @@ enum Cmd {
     /// Open block waiters, seeks and ranges: leak checks for range servers.
     Pending(oneshot::Sender<usize>),
     Inflight(oneshot::Sender<usize>),
+    /// The last `findingPeers` guard went away: conclude any update still waiting on peers.
+    FindingPeersReleased,
 }
 
 /// Handle to a core's replication actor.
@@ -166,6 +168,7 @@ enum Cmd {
 pub struct Replicator {
     tx: mpsc::UnboundedSender<Cmd>,
     dk: [u8; 32],
+    finding: Arc<std::sync::atomic::AtomicUsize>,
     shared: Arc<Shared>,
 }
 
@@ -200,18 +203,62 @@ impl<T> Drop for Pending<T> {
     }
 }
 
+/// A `findingPeers` guard: while one is held, this core's `update()` waits for a peer instead
+/// of concluding that no update is available; releasing it (explicitly or by dropping)
+/// concludes the update. JS `core.findingPeers()`'s `done`.
+pub struct FindingPeers {
+    guard: Option<FindingGuard>,
+}
+
+struct FindingGuard {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    tx: mpsc::UnboundedSender<Cmd>,
+}
+
+impl FindingGuard {
+    fn release(self) {
+        if self
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            let _ = self.tx.send(Cmd::FindingPeersReleased);
+        }
+    }
+}
+
+impl FindingPeers {
+    /// JS's `done()`; dropping the guard does the same.
+    pub fn release(mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.release();
+        }
+    }
+}
+
+impl Drop for FindingPeers {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            guard.release();
+        }
+    }
+}
+
 impl Replicator {
     pub(crate) fn new(core: &Core) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let finding = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let actor = Actor::new(
             Arc::downgrade(&core.inner),
             *core.discovery_key(),
             tx.clone(),
+            Arc::clone(&finding),
         );
         tokio::spawn(actor.run(rx, core.inner.store.closed()));
         Self {
             tx,
             dk: *core.discovery_key(),
+            finding,
             shared: Arc::new(Shared {
                 core: Arc::downgrade(&core.inner),
                 attaching: Mutex::new(()),
@@ -273,6 +320,20 @@ impl Replicator {
         });
         let p = self.pending(rx, waiter);
         async move { p.await.unwrap_or(Err(CoreError::Closed)) }
+    }
+
+    /// `core.findingPeers()`: hold this while the core's update is still looking for peers.
+    /// `update()` does not conclude "no update" before a first peer arrives while a guard is
+    /// held, and concludes as soon as the last one is released.
+    pub fn finding_peers(&self) -> FindingPeers {
+        self.finding
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        FindingPeers {
+            guard: Some(FindingGuard {
+                count: Arc::clone(&self.finding),
+                tx: self.tx.clone(),
+            }),
+        }
     }
 
     pub(crate) fn request_upgrade(&self) -> impl Future<Output = Result<bool, CoreError>> + use<> {
@@ -514,6 +575,8 @@ struct RoundtripQueue {
 struct Peer {
     tx: ChannelSender,
     mux: Mux,
+    /// The transport's remote public key, reported with every block it serves.
+    remote_public_key: Option<[u8; 32]>,
     remote_supports_seeks: bool,
     inflight: usize,
     inflight_range: (usize, usize),
@@ -595,6 +658,10 @@ struct Actor {
     downloading: bool,
     active: bool,
     had_peers: bool,
+    /// JS `replicator.findingPeers` (live) and `_foundPeers`: a core nobody has replicated yet
+    /// keeps an update waiting while guards are held, and concludes once they are released.
+    finding_peers: Arc<std::sync::atomic::AtomicUsize>,
+    found_peers: bool,
     if_available: i64,
     manifest_peer: Option<PeerId>,
     attached: Vec<Mux>,
@@ -634,11 +701,17 @@ fn inflight_window((min, max): (usize, usize), rtt: Option<u32>, peers: usize) -
 }
 
 impl Actor {
-    fn new(core: Weak<Inner>, dk: [u8; 32], tx: mpsc::UnboundedSender<Cmd>) -> Self {
+    fn new(
+        core: Weak<Inner>,
+        dk: [u8; 32],
+        tx: mpsc::UnboundedSender<Cmd>,
+        finding_peers: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         Self {
             core,
             dk,
             tx,
+            finding_peers,
             peers: vec![],
             order: vec![],
             inflight: Inflight::default(),
@@ -654,6 +727,7 @@ impl Actor {
             downloading: false,
             active: false,
             had_peers: false,
+            found_peers: false,
             if_available: 0,
             manifest_peer: None,
             attached: vec![],
@@ -769,6 +843,10 @@ impl Actor {
                 reply,
             } => self.add_block(core, index, force, waiter, reply),
             Cmd::Upgrade { waiter, reply } => self.add_upgrade(core, waiter, reply),
+            Cmd::FindingPeersReleased => {
+                self.found_peers = true;
+                self.check_upgrade_if_available(core);
+            }
             Cmd::Range {
                 start,
                 end,
@@ -897,6 +975,7 @@ impl Actor {
         self.peers[id] = Some(Peer {
             tx: channel.sender(),
             mux: mux.clone(),
+            remote_public_key: info.remote_public_key,
             remote_supports_seeks: false,
             inflight: 0,
             inflight_range: core
@@ -1741,7 +1820,14 @@ impl Actor {
             return;
         }
         let Some(u) = &self.upgrade else { return };
-        if u.waiters.is_empty() || !self.had_peers && self.order.is_empty() {
+        // JS: an update does not conclude before the first peer arrives while the caller is
+        // still finding peers; releasing the last guard concludes it. Without a guard the
+        // port keeps waiting for the first peer at all, as it always has.
+        let finding = self
+            .finding_peers
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0;
+        if u.waiters.is_empty() || !self.had_peers && (finding || !self.found_peers) {
             return;
         }
         let (length, fork) = {
@@ -2038,8 +2124,9 @@ impl Actor {
             return;
         }
         let matching = req.as_ref().is_some_and(|r| matching_request(r, &data));
+        let from = self.peer(id).and_then(|p| p.remote_public_key);
         let verified = if matching {
-            core.verify(data.clone()).await
+            core.verify(data.clone(), from).await
         } else {
             Ok(None)
         };
@@ -2093,7 +2180,12 @@ impl Actor {
             }
         }
         let proofs: Vec<Data> = ok.iter().map(|x| x.3.clone()).collect();
-        let results = core.verify_blocks(&proofs).await;
+        // One peer per message: every proof in a batch comes from the same channel.
+        let from = ok
+            .first()
+            .and_then(|(id, ..)| self.peer(*id))
+            .and_then(|p| p.remote_public_key);
+        let results = core.verify_blocks(&proofs, from).await;
         for ((id, rid, req, data), r) in ok.into_iter().zip(results) {
             self.after_verify(core, id, Some(rid), req, data, r);
         }
@@ -3322,7 +3414,12 @@ mod tests {
         .unwrap();
         assert_eq!(core.inflight_requests().await, 0);
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut actor = Actor::new(Arc::downgrade(&core.inner), *core.discovery_key(), tx);
+        let mut actor = Actor::new(
+            Arc::downgrade(&core.inner),
+            *core.discovery_key(),
+            tx,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
         let ((ar, aw), (br, bw)) = protomux::memory::duplex(16);
         let info = protomux::StreamInfo {
             handshake_hash: Some([7; 64]),

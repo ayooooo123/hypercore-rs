@@ -186,7 +186,14 @@ impl Default for CoreOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreEvent {
     Append { start: u64, length: u64 },
-    Download { index: u64, byte_length: u64 },
+    /// A block was received and stored. `from` is the public key of the peer that sent it
+    /// (JS `core.on('download', (index, byteLength, from))`'s `from.remotePublicKey`), when
+    /// the transport identifies the remote.
+    Download {
+        index: u64,
+        byte_length: u64,
+        from: Option<[u8; 32]>,
+    },
     Truncate { fork: u64, length: u64 },
     PeerAdd,
     PeerRemove,
@@ -838,6 +845,12 @@ impl Core {
         self.inner.replicator.get_or_init(|| Replicator::new(self))
     }
 
+    /// `core.findingPeers()`: hold the guard while this core's update is still looking for
+    /// peers, so it does not conclude that no update is available. Releasing it concludes.
+    pub fn finding_peers(&self) -> crate::replicator::FindingPeers {
+        self.replicator().finding_peers()
+    }
+
     /// Whether block `index` is stored locally.
     pub fn has(&self, index: u64) -> bool {
         self.state().bitfield.get(index)
@@ -1437,8 +1450,13 @@ impl Core {
     }
 
     /// `core.verify`: checks a remote proof and stores what it carries.
-    /// `Ok(None)` if it no longer applies; `Ok(Some(upgraded))` once stored.
-    pub(crate) async fn verify(&self, proof: Data) -> Result<Option<bool>> {
+    /// `Ok(None)` if it no longer applies; `Ok(Some(upgraded))` once stored. `from` is the
+    /// peer that sent the proof, reported with the stored block (JS `core.verify(proof, from)`).
+    pub(crate) async fn verify(
+        &self,
+        proof: Data,
+        from: Option<[u8; 32]>,
+    ) -> Result<Option<bool>> {
         let _w = self.inner.write.lock().await;
         let prepared = {
             let st = self.state();
@@ -1535,6 +1553,7 @@ impl Core {
             self.emit(CoreEvent::Download {
                 index: block.index,
                 byte_length: block.value.len() as u64,
+                from,
             });
         }
         Ok(Some(upgraded))
@@ -1542,7 +1561,11 @@ impl Core {
 
     /// Verifies plain block proofs (no upgrade) and stores them in one commit,
     /// as JS batches concurrent verifies in `_verifyShared`.
-    pub(crate) async fn verify_blocks(&self, proofs: &[Data]) -> Vec<Result<Option<bool>>> {
+    pub(crate) async fn verify_blocks(
+        &self,
+        proofs: &[Data],
+        from: Option<[u8; 32]>,
+    ) -> Vec<Result<Option<bool>>> {
         let _w = self.inner.write.lock().await;
         let mut results = Vec::with_capacity(proofs.len());
         let mut indices = vec![];
@@ -1631,6 +1654,7 @@ impl Core {
                 self.emit(CoreEvent::Download {
                     index: block.index,
                     byte_length: block.value.len() as u64,
+                    from,
                 });
             }
         }
@@ -1798,6 +1822,18 @@ pub struct WeakSession(Weak<SessionState>);
 impl WeakSession {
     pub fn is_alive(&self) -> bool {
         self.0.strong_count() != 0
+    }
+
+    /// The core's discovery key while the session is still open.
+    pub fn discovery_key(&self) -> Option<[u8; 32]> {
+        self.0
+            .upgrade()
+            .map(|state| *state.core.discovery_key())
+    }
+
+    /// A `findingPeers` guard on the session's core (see [`Core::finding_peers`]).
+    pub fn finding_peers(&self) -> Option<crate::replicator::FindingPeers> {
+        self.0.upgrade().map(|state| state.core.finding_peers())
     }
 
     pub fn close(&self) {
@@ -2027,6 +2063,11 @@ impl Session {
         self.core.update(timeout).await
     }
 
+    /// `session.findingPeers()`: the same guard [`Core::finding_peers`] returns.
+    pub fn finding_peers(&self) -> crate::replicator::FindingPeers {
+        self.core.finding_peers()
+    }
+
     pub async fn seek(&self, bytes: u64, wait: bool) -> Result<Option<(u64, u64)>> {
         self.ensure_open()?;
         self.core.seek(bytes, wait).await
@@ -2184,7 +2225,7 @@ mod feature_tests {
                     true,
                 )
                 .unwrap();
-            reader.verify(upgrade).await.unwrap();
+            reader.verify(upgrade, None).await.unwrap();
             let proof = |index| {
                 writer
                     .proof_for(
@@ -2197,12 +2238,12 @@ mod feature_tests {
                     .unwrap()
             };
             let results = reader
-                .verify_blocks(&(0..56).map(proof).collect::<Vec<_>>())
+                .verify_blocks(&(0..56).map(proof).collect::<Vec<_>>(), None)
                 .await;
             assert!(results.into_iter().all(|r| matches!(r, Ok(Some(false)))));
             cache.flush().unwrap();
             let results = reader
-                .verify_blocks(&(56..64).map(proof).collect::<Vec<_>>())
+                .verify_blocks(&(56..64).map(proof).collect::<Vec<_>>(), None)
                 .await;
             assert!(results.into_iter().all(|r| matches!(r, Ok(Some(false)))));
             // No destructors: RocksDB's normal close would flush a WAL-free memtable.
@@ -2260,6 +2301,7 @@ mod feature_tests {
                         true,
                     )
                     .unwrap(),
+                None,
             )
             .await
             .unwrap();
@@ -2278,7 +2320,7 @@ mod feature_tests {
                     proof.block.as_ref().unwrap().value.as_ref(),
                     values[index as usize]
                 );
-                assert_eq!(verifier.verify(proof).await.unwrap(), Some(false));
+                assert_eq!(verifier.verify(proof, None).await.unwrap(), Some(false));
             }
         }
     }
@@ -2345,7 +2387,7 @@ mod feature_tests {
                 true,
             )
             .unwrap();
-        assert_eq!(reader.verify(upgrade).await.unwrap(), Some(true));
+        assert_eq!(reader.verify(upgrade, None).await.unwrap(), Some(true));
         let proof = |index| {
             writer
                 .proof_for(
@@ -2360,7 +2402,7 @@ mod feature_tests {
         let mut bad = proof(1);
         bad.block.as_mut().unwrap().value = Bytes::from_static(b"bad");
         let results = reader
-            .verify_blocks(&[proof(0), bad, proof(1), proof(2)])
+            .verify_blocks(&[proof(0), bad, proof(1), proof(2)], None)
             .await;
         assert!(matches!(results[0], Ok(Some(false))));
         assert!(matches!(

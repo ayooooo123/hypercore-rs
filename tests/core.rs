@@ -4,7 +4,7 @@ use hypercore::crypto::KeyPair;
 use hypercore::encryption::EncryptionOptions;
 use hypercore::replicator::PROTOCOL;
 use hypercore::storage::Store;
-use hypercore::{Core, CoreError, CoreOptions, GetOptions};
+use hypercore::{Core, CoreError, CoreEvent, CoreOptions, FindingPeers, GetOptions};
 use protomux::{Mux, StreamInfo, memory};
 use tokio::time::timeout;
 
@@ -34,6 +34,11 @@ fn reader(store: &Store, key: &[u8; 32]) -> Core {
 
 /// Two muxes over an in-memory link that look like one secret-stream session.
 fn link() -> (Mux, Mux) {
+    link_as(None)
+}
+
+/// The same link, with each side naming its remote as a transport would.
+fn link_as(remote: Option<[u8; 32]>) -> (Mux, Mux) {
     let ((ar, aw), (br, bw)) = memory::duplex(64);
     let hh = Some([7u8; 64]);
     (
@@ -43,7 +48,7 @@ fn link() -> (Mux, Mux) {
             StreamInfo {
                 is_initiator: true,
                 handshake_hash: hh,
-                remote_public_key: None,
+                remote_public_key: remote,
             },
         ),
         Mux::new(
@@ -52,7 +57,7 @@ fn link() -> (Mux, Mux) {
             StreamInfo {
                 is_initiator: false,
                 handshake_hash: hh,
-                remote_public_key: None,
+                remote_public_key: remote,
             },
         ),
     )
@@ -313,4 +318,66 @@ async fn seek_past_the_local_length_waits_for_a_peer() {
         .unwrap()
         .unwrap();
     assert_eq!(got, blocks[2]);
+}
+
+/// A download reports the peer that served the block, as JS's `from.remotePublicKey` does, so a
+/// node can answer `isSourcePeer`.
+#[tokio::test]
+async fn a_download_event_names_the_serving_peer() {
+    let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (sa, sb) = (
+        Store::open(da.path()).unwrap(),
+        Store::open(db.path()).unwrap(),
+    );
+    let a = writer(&sa, 8);
+    a.append(&[b"block".as_slice()]).await.unwrap();
+    let b = reader(&sb, a.key());
+    let _session = b.session(true);
+    let peer = [0x5a; 32];
+    let (ma, mb) = link_as(Some(peer));
+    a.replicate(&ma);
+    b.replicate(&mb);
+
+    let mut events = b.events();
+    let got = timeout(T, b.get(0, GetOptions::default()))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got[..], b"block");
+    let download = loop {
+        let event = timeout(T, events.recv()).await.expect("download event").unwrap();
+        if let CoreEvent::Download { index: 0, from, .. } = event {
+            break from;
+        }
+    };
+    assert_eq!(download, Some(peer), "the event names the serving peer");
+}
+
+/// `findingPeers`: an update does not conclude that no update is available while a guard is
+/// held with no peer in sight; releasing the last guard concludes it.
+#[tokio::test]
+async fn finding_peers_holds_an_update_until_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path()).unwrap();
+    let core = reader(&store, &[0x42; 32]);
+
+    let guard = core.finding_peers();
+    let mut update = Box::pin(core.update(None));
+    assert!(
+        timeout(Duration::from_millis(200), &mut update).await.is_err(),
+        "a held findingPeers guard keeps the update waiting"
+    );
+    guard.release();
+    assert!(
+        !timeout(T, update).await.expect("concluded").unwrap(),
+        "releasing the guard concludes the update"
+    );
+
+    // Dropping a guard releases it too.
+    let held: FindingPeers = core.finding_peers();
+    let mut update = Box::pin(core.update(None));
+    assert!(timeout(Duration::from_millis(200), &mut update).await.is_err());
+    drop(held);
+    assert!(!timeout(T, update).await.expect("concluded").unwrap());
 }

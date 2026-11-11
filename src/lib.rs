@@ -18,3 +18,4 @@ pub use core::{
     AppendOptions, Core, CoreError, CoreEvent, CoreOptions, GetOptions, GroupUpdate, Head,
     RequestBag, Session,
 };
+pub use replicator::FindingPeers;
