@@ -185,7 +185,10 @@ impl Default for CoreOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreEvent {
-    Append { start: u64, length: u64 },
+    Append {
+        start: u64,
+        length: u64,
+    },
     /// A block was received and stored. `from` is the public key of the peer that sent it
     /// (JS `core.on('download', (index, byteLength, from))`'s `from.remotePublicKey`), when
     /// the transport identifies the remote.
@@ -194,7 +197,10 @@ pub enum CoreEvent {
         byte_length: u64,
         from: Option<[u8; 32]>,
     },
-    Truncate { fork: u64, length: u64 },
+    Truncate {
+        fork: u64,
+        length: u64,
+    },
     PeerAdd,
     PeerRemove,
     Close,
@@ -1452,11 +1458,7 @@ impl Core {
     /// `core.verify`: checks a remote proof and stores what it carries.
     /// `Ok(None)` if it no longer applies; `Ok(Some(upgraded))` once stored. `from` is the
     /// peer that sent the proof, reported with the stored block (JS `core.verify(proof, from)`).
-    pub(crate) async fn verify(
-        &self,
-        proof: Data,
-        from: Option<[u8; 32]>,
-    ) -> Result<Option<bool>> {
+    pub(crate) async fn verify(&self, proof: Data, from: Option<[u8; 32]>) -> Result<Option<bool>> {
         let _w = self.inner.write.lock().await;
         let prepared = {
             let st = self.state();
@@ -1826,9 +1828,7 @@ impl WeakSession {
 
     /// The core's discovery key while the session is still open.
     pub fn discovery_key(&self) -> Option<[u8; 32]> {
-        self.0
-            .upgrade()
-            .map(|state| *state.core.discovery_key())
+        self.0.upgrade().map(|state| *state.core.discovery_key())
     }
 
     /// A `findingPeers` guard on the session's core (see [`Core::finding_peers`]).

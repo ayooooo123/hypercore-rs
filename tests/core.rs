@@ -346,7 +346,10 @@ async fn a_download_event_names_the_serving_peer() {
         .unwrap();
     assert_eq!(&got[..], b"block");
     let download = loop {
-        let event = timeout(T, events.recv()).await.expect("download event").unwrap();
+        let event = timeout(T, events.recv())
+            .await
+            .expect("download event")
+            .unwrap();
         if let CoreEvent::Download { index: 0, from, .. } = event {
             break from;
         }
@@ -365,7 +368,9 @@ async fn finding_peers_holds_an_update_until_released() {
     let guard = core.finding_peers();
     let mut update = Box::pin(core.update(None));
     assert!(
-        timeout(Duration::from_millis(200), &mut update).await.is_err(),
+        timeout(Duration::from_millis(200), &mut update)
+            .await
+            .is_err(),
         "a held findingPeers guard keeps the update waiting"
     );
     guard.release();
@@ -377,7 +382,11 @@ async fn finding_peers_holds_an_update_until_released() {
     // Dropping a guard releases it too.
     let held: FindingPeers = core.finding_peers();
     let mut update = Box::pin(core.update(None));
-    assert!(timeout(Duration::from_millis(200), &mut update).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(200), &mut update)
+            .await
+            .is_err()
+    );
     drop(held);
     assert!(!timeout(T, update).await.expect("concluded").unwrap());
 }

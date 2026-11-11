@@ -217,11 +217,7 @@ struct FindingGuard {
 
 impl FindingGuard {
     fn release(self) {
-        if self
-            .count
-            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
-            == 1
-        {
+        if self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
             let _ = self.tx.send(Cmd::FindingPeersReleased);
         }
     }
