@@ -3661,12 +3661,8 @@ impl Actor {
                 return true;
             }
         }
-        if self.upgrade.as_ref().is_some_and(|u| u.inflight.is_empty())
+        self.upgrade.as_ref().is_some_and(|u| u.inflight.is_empty())
             && self.request_upgrade(core, id)
-        {
-            return true;
-        }
-        false
     }
 
     fn update_peer(&mut self, core: &Core, id: PeerId) {
