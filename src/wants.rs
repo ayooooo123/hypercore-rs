@@ -165,29 +165,6 @@ impl<H: Eq + Hash + Copy> LocalWants<H> {
         freed
     }
 
-    pub fn clear(&mut self) -> Vec<Want> {
-        let mut wants: Vec<Want> = self
-            .wants
-            .drain()
-            .map(|(batch, _)| Want {
-                start: batch * WANT_BATCH,
-                length: WANT_BATCH,
-                any: false,
-            })
-            .collect();
-        wants.extend(self.free.drain(..).map(|batch| Want {
-            start: batch * WANT_BATCH,
-            length: WANT_BATCH,
-            any: false,
-        }));
-        wants.extend(self.any.drain(..).map(|want| Want {
-            start: want.start,
-            length: want.length,
-            any: false,
-        }));
-        wants
-    }
-
     pub fn destroy(&mut self) {
         self.destroyed = true;
         self.wants.clear();
@@ -215,9 +192,10 @@ fn valid_batch_range(r: &Want) -> bool {
 
 impl RemoteWants {
     fn has_any(&self, start: u64, length: u64) -> bool {
-        let e = start + length;
+        // `any` ranges come from the wire unrounded: their ends may pass u64::MAX.
+        let e = start.saturating_add(length);
         for a in self.any.iter().flatten() {
-            let end = a.start + a.length;
+            let end = a.start.saturating_add(a.length);
             if a.start <= start && start < end {
                 return true;
             }
@@ -388,5 +366,16 @@ mod tests {
             "invalid ranges flip to all"
         );
         assert!(r.has(1_000_000));
+    }
+
+    #[test]
+    fn remote_any_range_at_u64_max_does_not_overflow() {
+        let mut r = RemoteWants::default();
+        assert!(r.add(Want {
+            start: u64::MAX,
+            length: 2,
+            any: true
+        }));
+        assert!(!r.has_range(5, 10));
     }
 }

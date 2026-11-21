@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use compact_encoding::Bytes;
-use compact_encoding::hypercore::{Data, Manifest, Node};
+use compact_encoding::hypercore::{Data, Manifest, Node, RequestUpgrade};
 use tokio::sync::{broadcast, watch};
 
 use crate::bitfield::Bitfield;
@@ -33,6 +33,10 @@ pub enum CoreError {
     CancelledWithReason(String),
     /// The block was truncated away while being requested.
     SnapshotNotAvailable,
+    /// Two signed trees exist for one length; the core is frozen until reopened.
+    Conflict,
+    /// npm marked the store as recovering (`hints.recovering`); recovery is not ported.
+    Recovering,
     Closed,
 }
 
@@ -54,6 +58,8 @@ impl fmt::Display for CoreError {
             Self::Cancelled => f.write_str("REQUEST_CANCELLED"),
             Self::CancelledWithReason(reason) => write!(f, "REQUEST_CANCELLED: {reason}"),
             Self::SnapshotNotAvailable => f.write_str("SNAPSHOT_NOT_AVAILABLE"),
+            Self::Conflict => f.write_str("Two conflicting signatures exist"),
+            Self::Recovering => f.write_str("Core is recovering; recovery mode is not supported"),
             Self::Closed => f.write_str("SESSION_CLOSED"),
         }
     }
@@ -183,6 +189,9 @@ impl Default for CoreOptions {
     }
 }
 
+/// Delivered through a bounded broadcast channel of 256 events. A subscriber that falls behind
+/// gets `RecvError::Lagged` and loses events; do not count `Download` events to measure progress
+/// (npm emits each event synchronously and loses none).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreEvent {
     Append {
@@ -200,6 +209,12 @@ pub enum CoreEvent {
     Truncate {
         fork: u64,
         length: u64,
+    },
+    /// A peer proved a second signed tree at `length` on `fork` (npm `'conflict'`). The core
+    /// stays frozen until it is reopened: no appends, no replication.
+    Conflict {
+        length: u64,
+        fork: u64,
     },
     PeerAdd,
     PeerRemove,
@@ -225,6 +240,8 @@ pub struct AppendOptions {
 pub struct Head {
     pub fork: u64,
     pub length: u64,
+    /// Raw tree bytes, including any per-block encryption padding
+    /// (see [`Core::byte_length`] for npm's `byteLength`).
     pub byte_length: u64,
 }
 
@@ -243,7 +260,10 @@ pub(crate) struct Header {
     pub timestamp: u64,
     pub contiguous_length: u64,
     pub remote_contiguous_length: u64,
+    /// A proven conflict (npm `header.frozen`). In memory only, as in npm: reopening clears it.
     pub frozen: bool,
+    /// npm's `hints.recovering` stamp, kept as stored. Non-zero refuses appends.
+    pub recovering: u64,
     pub group: Option<storage::CoreGroup>,
     pub encryption_key: Option<Bytes>,
 }
@@ -266,7 +286,8 @@ impl Header {
             timestamp: head.timestamp,
             contiguous_length: hints.contiguous_length,
             remote_contiguous_length: hints.remote_contiguous_length,
-            frozen: hints.recovering != 0,
+            frozen: false,
+            recovering: hints.recovering,
             group: storage.get_group()?,
             encryption_key: auth.encryption_key,
         }))
@@ -306,7 +327,7 @@ impl Header {
         storage::HeaderHints {
             contiguous_length: self.contiguous_length,
             remote_contiguous_length: self.remote_contiguous_length,
-            recovering: self.frozen as u64,
+            recovering: self.recovering,
         }
     }
 
@@ -368,6 +389,15 @@ impl State {
             fork: self.tree.fork,
             length: self.tree.length,
             byte_length: self.tree.byte_length,
+        }
+    }
+
+    /// Bytes of padding each stored block carries (encrypted cores only).
+    fn padding(&self) -> u64 {
+        if self.encryption.is_some() && self.header.manifest.is_some() {
+            PADDING as u64
+        } else {
+            0
         }
     }
 
@@ -467,7 +497,7 @@ pub(crate) struct Inner {
     pub key: [u8; 32],
     pub discovery_key: [u8; 32],
     state: Mutex<State>,
-    write: tokio::sync::Mutex<()>,
+    write: Arc<tokio::sync::Mutex<()>>,
     exclusive: Arc<tokio::sync::Mutex<()>>,
     head: watch::Sender<Head>,
     events: OnceLock<broadcast::Sender<CoreEvent>>,
@@ -498,6 +528,10 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 impl Core {
     /// Opens (or creates) the core described by `opts` in `store`.
+    ///
+    /// Open a key once per process and share the handle (`Core` is `Clone`). Two `Core`s
+    /// on one key are two writers with separate locks and trees, and they corrupt the log.
+    /// corestore-rs dedupes opens by discovery key, as npm corestore does.
     pub fn open(store: &Store, opts: CoreOptions) -> Result<Core> {
         let manifest = opts.manifest.clone().or_else(|| {
             opts.key_pair.as_ref().map(|kp| {
@@ -634,7 +668,7 @@ impl Core {
                 storage,
                 store,
                 state: Mutex::new(state),
-                write: tokio::sync::Mutex::new(()),
+                write: Arc::new(tokio::sync::Mutex::new(())),
                 exclusive: Arc::new(tokio::sync::Mutex::new(())),
                 head: watch::channel(head).0,
                 events: OnceLock::new(),
@@ -656,6 +690,24 @@ impl Core {
 
     pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Flushes `sb`, then runs `apply` (the in-memory commit and its events), in one task
+    /// that outlives the caller: a dropped caller future cannot leave disk ahead of memory.
+    /// The write lock `write` is held until both are done.
+    async fn commit<T: Send + 'static>(
+        &self,
+        write: tokio::sync::OwnedMutexGuard<()>,
+        sb: storage::Batch,
+        apply: impl FnOnce(&Core) -> T + Send + 'static,
+    ) -> Result<T> {
+        let core = self.clone();
+        blocking(move || {
+            let _write = write;
+            core.inner.storage.flush(sb)?;
+            Ok(apply(&core))
+        })
+        .await
     }
 
     pub fn stored_head(store: &Store, discovery_key: &[u8; 32]) -> Result<Option<Head>> {
@@ -694,8 +746,12 @@ impl Core {
         self.head().length
     }
 
+    /// npm `core.byteLength`: plaintext bytes, without the per-block encryption padding.
     pub fn byte_length(&self) -> u64 {
-        self.head().byte_length
+        let st = self.state();
+        st.tree
+            .byte_length
+            .saturating_sub(st.tree.length * st.padding())
     }
 
     pub fn fork(&self) -> u64 {
@@ -752,12 +808,7 @@ impl Core {
 
     /// Bytes of padding each stored block carries (encrypted cores only).
     pub fn padding(&self) -> usize {
-        let st = self.state();
-        if st.encryption.is_some() && st.header.manifest.is_some() {
-            PADDING
-        } else {
-            0
-        }
+        self.state().padding() as usize
     }
 
     pub fn storage(&self) -> &CoreStorage {
@@ -884,6 +935,10 @@ impl Core {
         let Some(e) = st.encryption.as_ref() else {
             return block;
         };
+        // npm `block.subarray(8)`: a signed block shorter than the padding reads as empty.
+        if block.len() < PADDING {
+            return Bytes::new();
+        }
         let mut buf = block.to_vec();
         e.decrypt(index, &mut buf);
         Bytes::from(buf).slice(PADDING..)
@@ -1030,7 +1085,10 @@ impl Core {
         let padding = self.padding() as u64;
         let st = self.state();
         let (off, len) = merkle::byte_range(&st.tree, &self.inner.storage, 2 * index)?;
-        Ok((off - padding * index, len - padding))
+        Ok((
+            off.saturating_sub(padding * index),
+            len.saturating_sub(padding),
+        ))
     }
 
     /// Appends blocks; returns the new head. The core must be writable.
@@ -1043,14 +1101,17 @@ impl Core {
         blocks: &[B],
         opts: AppendOptions,
     ) -> Result<Head> {
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         self.ensure_open()?;
         let (batch, sb, start, end, contig, stamp) = {
             let st = self.state();
             let kp = st.header.key_pair();
             let verifier = st.verifier.as_ref().ok_or(CoreError::NotWritable)?;
             if st.header.frozen {
-                return Err(CoreError::NotWritable);
+                return Err(CoreError::Conflict);
+            }
+            if st.header.recovering != 0 {
+                return Err(CoreError::Recovering);
             }
             if kp.is_none() && !(opts.writable && verifier.quorum == 0) {
                 return Err(CoreError::NotWritable);
@@ -1081,16 +1142,21 @@ impl Core {
             batch.signature = if let Some(kp) = kp {
                 Some(verifier.sign(&batch, &kp).ok_or(CoreError::NotWritable)?)
             } else {
-                if verifier
+                // Unsigned blocks verify only at the prologue length, whose hash stands in
+                // for a signature.
+                match verifier
                     .prologue
                     .as_ref()
-                    .is_some_and(|p| batch.length < p.length)
+                    .map(|p| batch.length.cmp(&p.length))
                 {
-                    return Err(CoreError::BadArgument(
-                        "Append is not consistent with prologue".into(),
-                    ));
+                    Some(std::cmp::Ordering::Less) => {
+                        return Err(CoreError::BadArgument(
+                            "Append is not consistent with prologue".into(),
+                        ));
+                    }
+                    Some(std::cmp::Ordering::Equal) => None,
+                    _ => return Err(CoreError::NotWritable),
                 }
-                None
             };
             let end = batch.length;
             write_tree_ops(&mut batch, &mut sb);
@@ -1104,34 +1170,35 @@ impl Core {
             header.write_new_head(&mut sb, &batch.roots);
             (batch, sb, start, end, contig, header.timestamp)
         };
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
-        let head = {
-            let mut st = self.state();
-            st.tree = batch.state();
-            st.header.length = batch.length;
-            st.header.fork = batch.fork;
-            st.header.timestamp = stamp;
-            st.header.signature = batch.signature.clone();
-            st.header.contiguous_length = contig;
-            st.set_bits(start, end, true);
-            self.publish(&st);
-            st.head()
-        };
-        self.flush_hooks();
-        self.emit(CoreEvent::Append {
-            start,
-            length: end - start,
-        });
-        if let Some(r) = self.inner.replicator.get() {
-            r.on_append(start, end - start);
-        }
-        Ok(head)
+        self.commit(w, sb, move |core| {
+            let head = {
+                let mut st = core.state();
+                st.tree = batch.state();
+                st.header.length = batch.length;
+                st.header.fork = batch.fork;
+                st.header.timestamp = stamp;
+                st.header.signature = batch.signature.clone();
+                st.header.contiguous_length = contig;
+                st.set_bits(start, end, true);
+                core.publish(&st);
+                st.head()
+            };
+            core.flush_hooks();
+            core.emit(CoreEvent::Append {
+                start,
+                length: end - start,
+            });
+            if let Some(r) = core.inner.replicator.get() {
+                r.on_append(start, end - start);
+            }
+            head
+        })
+        .await
     }
 
     /// Truncates to `length`, moving to `fork` (default: current fork + 1).
     pub async fn truncate(&self, length: u64, fork: Option<u64>) -> Result<()> {
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         let (batch, sb, old, stamp) = {
             let st = self.state();
             let kp = st.header.key_pair().ok_or(CoreError::NotWritable)?;
@@ -1158,10 +1225,8 @@ impl Core {
             let (sb, stamp) = self.truncate_batch(&st, &mut batch);
             (batch, sb, st.tree.length, stamp)
         };
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
-        self.after_truncate(&batch, old, stamp);
-        Ok(())
+        self.commit(w, sb, move |core| core.after_truncate(&batch, old, stamp))
+            .await
     }
 
     /// Storage writes for a truncation or reorg batch (`_truncate`).
@@ -1220,7 +1285,7 @@ impl Core {
         if start >= end {
             return Ok(());
         }
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         let (sb, contig, stamp) = {
             let st = self.state();
             let mut sb = self.inner.storage.write();
@@ -1253,18 +1318,18 @@ impl Core {
             sb.delete_block_range(start, end);
             (sb, contig, header.timestamp)
         };
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
-        {
-            let mut st = self.state();
-            st.header.contiguous_length = contig;
-            st.header.timestamp = stamp;
-            st.set_bits(start, end, false);
-        }
-        if let Some(r) = self.inner.replicator.get() {
-            r.on_clear(start, end - start);
-        }
-        Ok(())
+        self.commit(w, sb, move |core| {
+            {
+                let mut st = core.state();
+                st.header.contiguous_length = contig;
+                st.header.timestamp = stamp;
+                st.set_bits(start, end, false);
+            }
+            if let Some(r) = core.inner.replicator.get() {
+                r.on_clear(start, end - start);
+            }
+        })
+        .await
     }
 
     /// Deletes the core and all its data from storage. Consumes the handle;
@@ -1459,7 +1524,7 @@ impl Core {
     /// `Ok(None)` if it no longer applies; `Ok(Some(upgraded))` once stored. `from` is the
     /// peer that sent the proof, reported with the stored block (JS `core.verify(proof, from)`).
     pub(crate) async fn verify(&self, proof: Data, from: Option<[u8; 32]>) -> Result<Option<bool>> {
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         let prepared = {
             let st = self.state();
             if proof.fork != st.tree.fork {
@@ -1527,37 +1592,42 @@ impl Core {
             )
         };
         let (batch, sb, block, contig, learned, stamp) = prepared;
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
         let upgraded = batch.upgraded;
-        {
-            let mut st = self.state();
-            if let Some(m) = learned {
-                st.set_manifest(m);
+        let download = proof
+            .block
+            .as_ref()
+            .map(|b| (b.index, b.value.len() as u64));
+        self.commit(w, sb, move |core| {
+            {
+                let mut st = core.state();
+                if let Some(m) = learned {
+                    st.set_manifest(m);
+                }
+                if upgraded {
+                    st.tree = batch.state();
+                    st.header.fork = batch.fork;
+                    st.header.length = batch.length;
+                    st.header.signature = batch.signature.clone();
+                }
+                st.header.timestamp = stamp;
+                st.header.contiguous_length = contig;
+                if let Some(i) = block {
+                    st.set_bits(i, i + 1, true);
+                }
+                core.publish(&st);
             }
             if upgraded {
-                st.tree = batch.state();
-                st.header.fork = batch.fork;
-                st.header.length = batch.length;
-                st.header.signature = batch.signature.clone();
+                core.flush_hooks();
             }
-            st.header.timestamp = stamp;
-            st.header.contiguous_length = contig;
-            if let Some(i) = block {
-                st.set_bits(i, i + 1, true);
+            if let Some((index, byte_length)) = download {
+                core.emit(CoreEvent::Download {
+                    index,
+                    byte_length,
+                    from,
+                });
             }
-            self.publish(&st);
-        }
-        if upgraded {
-            self.flush_hooks();
-        }
-        if let Some(block) = proof.block.as_ref() {
-            self.emit(CoreEvent::Download {
-                index: block.index,
-                byte_length: block.value.len() as u64,
-                from,
-            });
-        }
+        })
+        .await?;
         Ok(Some(upgraded))
     }
 
@@ -1568,8 +1638,10 @@ impl Core {
         proofs: &[Data],
         from: Option<[u8; 32]>,
     ) -> Vec<Result<Option<bool>>> {
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         let mut results = Vec::with_capacity(proofs.len());
+        // A proof without a block can still queue tree nodes: commit whenever one verified.
+        let mut queued = false;
         let mut indices = vec![];
         let mut sb = self.inner.storage.write();
         let contig = {
@@ -1597,6 +1669,7 @@ impl Core {
                     }
                     Ok(Some(false))
                 })();
+                queued |= matches!(r, Ok(Some(_)));
                 results.push(r);
             }
             let mut pages: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
@@ -1630,12 +1703,39 @@ impl Core {
             header.write_head(&mut sb, &st.tree.roots);
             c
         };
-        if indices.is_empty() {
+        if !queued {
             return results;
         }
-        let storage = self.inner.storage.clone();
-        if let Err(e) = blocking(move || storage.flush(sb)).await {
-            let msg = e.to_string();
+        let downloads: Vec<(u64, u64)> = proofs
+            .iter()
+            .zip(&results)
+            .filter(|(_, result)| matches!(result, Ok(Some(_))))
+            .filter_map(|(proof, _)| proof.block.as_ref())
+            .map(|block| (block.index, block.value.len() as u64))
+            .collect();
+        let committed = self
+            .commit(w, sb, move |core| {
+                {
+                    let mut st = core.state();
+                    st.header.contiguous_length = contig;
+                    for i in indices {
+                        st.set_bits(i, i + 1, true);
+                    }
+                }
+                for (index, byte_length) in downloads {
+                    core.emit(CoreEvent::Download {
+                        index,
+                        byte_length,
+                        from,
+                    });
+                }
+            })
+            .await;
+        if let Err(e) = committed {
+            let msg = match e {
+                CoreError::Storage(e) => e.to_string(),
+                e => e.to_string(),
+            };
             return results
                 .into_iter()
                 .map(|r| match r {
@@ -1643,22 +1743,6 @@ impl Core {
                     other => other,
                 })
                 .collect();
-        }
-        let mut st = self.state();
-        st.header.contiguous_length = contig;
-        for i in indices {
-            st.set_bits(i, i + 1, true);
-        }
-        for (proof, result) in proofs.iter().zip(&results) {
-            if matches!(result, Ok(Some(_)))
-                && let Some(block) = &proof.block
-            {
-                self.emit(CoreEvent::Download {
-                    index: block.index,
-                    byte_length: block.value.len() as u64,
-                    from,
-                });
-            }
         }
         results
     }
@@ -1679,7 +1763,7 @@ impl Core {
     /// Applies a finished reorg batch: truncates to the fork point and adopts
     /// the remote tree.
     pub(crate) async fn apply_reorg(&self, mut batch: Batch) -> Result<bool> {
-        let _w = self.inner.write.lock().await;
+        let w = self.inner.write.clone().lock_owned().await;
         let (sb, old, stamp) = {
             let st = self.state();
             if !batch.commitable(&st.tree) {
@@ -1688,20 +1772,24 @@ impl Core {
             let (sb, stamp) = self.truncate_batch(&st, &mut batch);
             (sb, st.tree.length, stamp)
         };
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
-        self.after_truncate(&batch, old, stamp);
+        self.commit(w, sb, move |core| core.after_truncate(&batch, old, stamp))
+            .await?;
         Ok(true)
     }
 
-    /// `core.checkConflict`: true if `proof` proves two signed trees exist for
-    /// the same length and fork (the core is frozen), or is itself invalid.
+    /// `core.checkConflict`: true if `proof` proves two signed trees exist for the same
+    /// length and fork (the core is frozen in memory and `Conflict` is emitted), or if the
+    /// proof or our own tree at that length does not verify.
+    ///
+    /// Only a pure upgrade is evidence. A proof that also carries a block, hash or seek
+    /// replaces a root with that subtree's nodes, so its upgrade nodes are not the roots;
+    /// npm compares them anyway and freezes on a replayed honest proof.
     pub(crate) async fn check_conflict(&self, proof: &Data) -> Result<bool> {
         let Some(upgrade) = proof.upgrade.as_ref() else {
             return Ok(false);
         };
-        let local = {
-            let st = self.state();
+        {
+            let mut st = self.state();
             if st.tree.length < upgrade.length
                 || proof.fork != st.tree.fork
                 || st.header.manifest.is_none()
@@ -1715,22 +1803,40 @@ impl Core {
             {
                 return Ok(true);
             }
-            let roots = merkle::roots_at(&self.inner.storage, upgrade.length).unwrap_or_default();
-            crypto::tree_hash(&roots)
-        };
-        if crypto::tree_hash(&upgrade.nodes) == local {
-            return Ok(false);
-        }
-        let _w = self.inner.write.lock().await;
-        let sb = {
-            let mut st = self.state();
+            if proof.block.is_some() || proof.hash.is_some() || proof.seek.is_some() {
+                return Ok(false);
+            }
+            // Our side: our own signed tree must prove that length too.
+            let request = ProofRequest {
+                upgrade: Some(RequestUpgrade {
+                    start: 0,
+                    length: upgrade.length,
+                }),
+                ..Default::default()
+            };
+            let ours_verify = merkle::proof(&st.tree, &self.inner.storage, &request)
+                .and_then(|local| merkle::verify_fully_remote(&st.tree, &local))
+                .is_ok_and(|local| st.verify_batch_upgrade(&local, None).is_ok());
+            let Ok(roots) = merkle::roots_at(&self.inner.storage, upgrade.length) else {
+                return Ok(true);
+            };
+            if !ours_verify {
+                return Ok(true);
+            }
+            // A verified pure upgrade from 0 starts with exactly the roots at its length.
+            if upgrade
+                .nodes
+                .get(..roots.len())
+                .is_some_and(|remote| crypto::tree_hash(remote) == crypto::tree_hash(&roots))
+            {
+                return Ok(false);
+            }
             st.header.frozen = true;
-            let mut sb = self.inner.storage.write();
-            st.header.write_head(&mut sb, &st.tree.roots);
-            sb
-        };
-        let storage = self.inner.storage.clone();
-        blocking(move || storage.flush(sb)).await?;
+        }
+        self.emit(CoreEvent::Conflict {
+            length: upgrade.length,
+            fork: proof.fork,
+        });
         Ok(true)
     }
 
@@ -1772,7 +1878,8 @@ fn write_tree_ops(batch: &mut Batch, sb: &mut storage::Batch) {
 pub struct GetOptions {
     pub wait: bool,
     pub timeout: Option<Duration>,
-    /// Request even if the remote has not signalled it can upgrade us.
+    /// JS `force`. In npm it only bypasses push-only mode, which this port does not have; the
+    /// peer upgrade checks apply to every request.
     pub force: bool,
     pub raw: bool,
     pub bag: Option<RequestBag>,
@@ -2432,5 +2539,330 @@ mod feature_tests {
                 *value
             );
         }
+    }
+
+    fn writer_core(store: &Store, seed: u8) -> Core {
+        Core::open(
+            store,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[seed; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn reader_core(store: &Store, key: [u8; 32]) -> Core {
+        Core::open(
+            store,
+            CoreOptions {
+                key: Some(key),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    fn upgrade_request(length: u64) -> ProofRequest {
+        ProofRequest {
+            upgrade: Some(RequestUpgrade { start: 0, length }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_geometry_fails_at_once() {
+        use compact_encoding::hypercore::RequestBlock;
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source")).unwrap();
+        let writer = writer_core(&source, 30);
+        writer.append(&[b"a", b"b"]).await.unwrap();
+        let far = (1 << 63) - 1;
+        let requests = [
+            // Used to spin `nodes` times on a zero iterator factor.
+            ProofRequest {
+                hash: Some(RequestBlock {
+                    index: far,
+                    nodes: u64::MAX,
+                }),
+                ..Default::default()
+            },
+            ProofRequest {
+                hash: Some(RequestBlock {
+                    index: far,
+                    nodes: 0,
+                }),
+                ..Default::default()
+            },
+            ProofRequest {
+                upgrade: Some(RequestUpgrade {
+                    start: 1 << 63,
+                    length: 1,
+                }),
+                ..Default::default()
+            },
+        ];
+        for request in &requests {
+            assert!(writer.proof_for(request, false).is_err(), "{request:?}");
+        }
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = reader_core(&destination, *writer.key());
+        let mut proof = writer.proof_for(&upgrade_request(2), true).unwrap();
+        let upgrade = proof.upgrade.as_mut().unwrap();
+        upgrade.start = 1;
+        upgrade.length = 1;
+        upgrade.nodes[0].index = far;
+        assert!(reader.verify(proof, None).await.is_err());
+        assert_eq!(reader.length(), 0);
+    }
+
+    #[tokio::test]
+    async fn byte_length_excludes_encryption_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let core = Core::open(
+            &store,
+            CoreOptions {
+                key_pair: Some(KeyPair::from_seed(&[31; 32])),
+                encryption_key: Some([7; 32]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        core.append(&[&b"abc"[..], &b"de"[..]]).await.unwrap();
+        assert_eq!(core.padding(), PADDING);
+        assert_eq!(core.byte_length(), 5);
+        assert_eq!(core.head().byte_length, 5 + 2 * PADDING as u64);
+        assert_eq!(core.byte_range(1).unwrap(), (3, 2));
+    }
+
+    #[tokio::test]
+    async fn block_shorter_than_padding_reads_empty() {
+        use compact_encoding::hypercore::RequestBlock;
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source")).unwrap();
+        let writer = writer_core(&source, 32);
+        writer.append(&[b"xy"]).await.unwrap();
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = Core::open(
+            &destination,
+            CoreOptions {
+                key: Some(*writer.key()),
+                encryption_key: Some([7; 32]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let proof = writer
+            .proof_for(
+                &ProofRequest {
+                    block: Some(RequestBlock { index: 0, nodes: 0 }),
+                    upgrade: Some(RequestUpgrade {
+                        start: 0,
+                        length: 1,
+                    }),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(reader.verify(proof, None).await.unwrap(), Some(true));
+        assert_eq!(reader.padding(), PADDING);
+        assert!(reader.get_local(0).unwrap().unwrap().is_empty());
+        assert_eq!(reader.byte_length(), 0);
+    }
+
+    #[tokio::test]
+    async fn replayed_honest_block_and_upgrade_proof_does_not_freeze() {
+        use compact_encoding::hypercore::RequestBlock;
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source")).unwrap();
+        let writer = writer_core(&source, 33);
+        writer
+            .append(&[b"a", b"b", b"c", b"d", b"e"])
+            .await
+            .unwrap();
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = reader_core(&destination, *writer.key());
+        let upgrade = writer.proof_for(&upgrade_request(5), true).unwrap();
+        assert_eq!(reader.verify(upgrade, None).await.unwrap(), Some(true));
+        assert!(reader.manifest().is_some());
+        let replay = writer
+            .proof_for(
+                &ProofRequest {
+                    block: Some(RequestBlock { index: 1, nodes: 0 }),
+                    upgrade: Some(RequestUpgrade {
+                        start: 0,
+                        length: 5,
+                    }),
+                    ..Default::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(replay.request, 0);
+        assert!(!reader.check_conflict(&replay).await.unwrap());
+        let pure = writer.proof_for(&upgrade_request(5), true).unwrap();
+        assert!(!reader.check_conflict(&pure).await.unwrap());
+        assert!(!reader.state().header.frozen);
+    }
+
+    #[tokio::test]
+    async fn two_signed_trees_freeze_until_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a");
+        let store = Store::open(&path).unwrap();
+        let core = writer_core(&store, 34);
+        core.append(&[b"a", b"b", b"c"]).await.unwrap();
+        let other_store = Store::open(&dir.path().join("b")).unwrap();
+        let other = writer_core(&other_store, 34);
+        other.append(&[b"a", b"b", b"x"]).await.unwrap();
+        let mut events = core.events();
+        let evidence = other.proof_for(&upgrade_request(3), true).unwrap();
+        assert!(core.check_conflict(&evidence).await.unwrap());
+        assert_eq!(
+            events.try_recv().unwrap(),
+            CoreEvent::Conflict { length: 3, fork: 0 }
+        );
+        assert!(matches!(
+            core.append(&[b"d"]).await,
+            Err(CoreError::Conflict)
+        ));
+        let hints = core.storage().get_hints().unwrap().unwrap_or_default();
+        assert_eq!(hints.recovering, 0);
+        drop(core);
+        store.close();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let core = writer_core(&store, 34);
+        assert_eq!(core.append(&[b"d"]).await.unwrap().length, 4);
+    }
+
+    #[tokio::test]
+    async fn npm_recovering_hint_is_kept_and_refuses_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let core = writer_core(&store, 35);
+        core.append(&[b"a"]).await.unwrap();
+        let stamp = 1_700_000_000_000;
+        let mut tx = core.storage().write();
+        tx.set_hints(&storage::HeaderHints {
+            contiguous_length: 1,
+            remote_contiguous_length: 0,
+            recovering: stamp,
+        });
+        core.storage().flush(tx).unwrap();
+        drop(core);
+        store.close();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        let core = writer_core(&store, 35);
+        assert!(!core.state().header.frozen);
+        assert!(matches!(
+            core.append(&[b"b"]).await,
+            Err(CoreError::Recovering)
+        ));
+        core.clear(0, 1).await.unwrap();
+        let hints = core.storage().get_hints().unwrap().unwrap();
+        assert_eq!(hints.recovering, stamp);
+    }
+
+    #[tokio::test]
+    async fn append_dropped_at_its_first_await_still_commits_memory() {
+        use compact_encoding::hypercore::RequestBlock;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer");
+        let store = Store::open(&path).unwrap();
+        let core = writer_core(&store, 36);
+        {
+            let first = core.append(&[b"a"]);
+            tokio::pin!(first);
+            tokio::select! {
+                biased;
+                _ = &mut first => {}
+                () = std::future::ready(()) => {}
+            }
+        }
+        core.append(&[b"b"]).await.unwrap();
+        let key = *core.key();
+        drop(core);
+        store.close();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let core = reader_core(&store, key);
+        assert_eq!(core.length(), 2);
+        let verifier_store = Store::open(&dir.path().join("verifier")).unwrap();
+        let verifier = reader_core(&verifier_store, key);
+        let upgrade = core.proof_for(&upgrade_request(2), true).unwrap();
+        assert_eq!(verifier.verify(upgrade, None).await.unwrap(), Some(true));
+        for (index, value) in [b"a", b"b"].iter().enumerate() {
+            let proof = core
+                .proof_for(
+                    &ProofRequest {
+                        block: Some(RequestBlock {
+                            index: index as u64,
+                            nodes: 1,
+                        }),
+                        ..Default::default()
+                    },
+                    false,
+                )
+                .unwrap();
+            assert_eq!(proof.block.as_ref().unwrap().value.as_ref(), *value);
+            assert_eq!(verifier.verify(proof, None).await.unwrap(), Some(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn unsigned_append_needs_a_covering_prologue() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let manifest = Manifest {
+            quorum: 0,
+            signers: vec![],
+            ..verifier::default_signer_manifest([38; 32])
+        };
+        let core = Core::open(
+            &store,
+            CoreOptions {
+                manifest: Some(manifest),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let unsigned = AppendOptions {
+            writable: true,
+            max_length: None,
+        };
+        assert!(matches!(
+            core.append_with(&[b"a"], unsigned).await,
+            Err(CoreError::NotWritable)
+        ));
+        assert_eq!(core.length(), 0);
+    }
+
+    #[tokio::test]
+    async fn verify_blocks_commits_a_proof_without_a_block() {
+        use compact_encoding::hypercore::RequestBlock;
+        let dir = tempfile::tempdir().unwrap();
+        let source = Store::open(&dir.path().join("source")).unwrap();
+        let writer = writer_core(&source, 37);
+        writer.append(&[b"a", b"b", b"c", b"d"]).await.unwrap();
+        let destination = Store::open(&dir.path().join("destination")).unwrap();
+        let reader = reader_core(&destination, *writer.key());
+        let upgrade = writer.proof_for(&upgrade_request(4), true).unwrap();
+        assert_eq!(reader.verify(upgrade, None).await.unwrap(), Some(true));
+        let proof = writer
+            .proof_for(
+                &ProofRequest {
+                    hash: Some(RequestBlock { index: 1, nodes: 1 }),
+                    ..Default::default()
+                },
+                false,
+            )
+            .unwrap();
+        let results = reader.verify_blocks(&[proof], None).await;
+        assert!(matches!(results[0], Ok(Some(false))));
+        assert!(reader.storage().get_tree_node(1).unwrap().is_some());
     }
 }

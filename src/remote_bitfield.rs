@@ -22,6 +22,10 @@ pub struct RemoteBitfield {
     segment_pages: BTreeMap<u64, u64>,
     max_segments: u64,
     max_pages: u64,
+    /// Most pages this bitfield may hold; a `true` write that needs more is refused.
+    page_budget: u64,
+    /// A write was refused because of `page_budget`.
+    over_budget: bool,
 }
 
 impl Default for RemoteBitfield {
@@ -36,14 +40,45 @@ impl RemoteBitfield {
     /// Bits covered by one segment.
     pub const BITS_PER_SEGMENT: u64 = crate::bitfield::BITS_PER_SEGMENT;
 
-    /// Creates an empty remote bitfield.
+    /// Creates an empty remote bitfield with no page budget.
     pub fn new() -> Self {
+        Self::with_page_budget(u64::MAX)
+    }
+
+    /// Creates an empty remote bitfield that holds at most `pages` pages. A `true` write
+    /// (`set`, `set_range`, `insert`) that needs more pages changes nothing and marks the
+    /// bitfield [`over_budget`](Self::over_budget); its bits read as unset. Not in JS.
+    pub fn with_page_budget(pages: u64) -> Self {
         Self {
             pages: BTreeMap::new(),
             segment_pages: BTreeMap::new(),
             max_segments: 0,
             max_pages: 0,
+            page_budget: pages,
+            over_budget: false,
         }
+    }
+
+    /// Pages allocated now.
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// True once a write was refused because it would pass the page budget.
+    pub fn over_budget(&self) -> bool {
+        self.over_budget
+    }
+
+    /// Whether a `true` write to pages `first..=last` fits the page budget; marks the
+    /// bitfield over budget if not. Costs O(existing pages), never O(last - first).
+    fn reserve(&mut self, first: u64, last: u64) -> bool {
+        let existing = self.pages.range(first..=last).count() as u64;
+        let needed = (last - first + 1) - existing;
+        if needed > self.page_budget.saturating_sub(self.pages.len() as u64) {
+            self.over_budget = true;
+            return false;
+        }
+        true
     }
 
     fn ensure_page(&mut self, page_index: u64) -> &mut Page {
@@ -77,7 +112,9 @@ impl RemoteBitfield {
         let page_index = index / BITS_PER_PAGE;
         let bit = (index % BITS_PER_PAGE) as u32;
         if val {
-            set_bit(&mut self.ensure_page(page_index)[..], bit, true);
+            if self.reserve(page_index, page_index) {
+                set_bit(&mut self.ensure_page(page_index)[..], bit, true);
+            }
         } else if let Some(words) = self.pages.get_mut(&page_index) {
             set_bit(&mut words[..], bit, false);
         }
@@ -87,6 +124,9 @@ impl RemoteBitfield {
     /// and clearing is capped at the highest page ever touched.
     pub fn set_range(&mut self, start: u64, end: u64, val: bool) {
         if val {
+            if start < end && !self.reserve(start / BITS_PER_PAGE, (end - 1) / BITS_PER_PAGE) {
+                return;
+            }
             let mut pos = start;
             while pos < end {
                 let page_index = pos / BITS_PER_PAGE;
@@ -254,7 +294,8 @@ impl RemoteBitfield {
     }
 
     /// Applies a wire `bitfield` message: overwrites `words` at 32-bit aligned
-    /// bit `start`. Returns false when `start` is not 32-bit aligned.
+    /// bit `start`. Returns false when `start` is not 32-bit aligned. Over the page
+    /// budget it writes nothing and marks the bitfield over budget.
     pub fn insert(&mut self, start: u64, words: &[u32]) -> bool {
         if !start.is_multiple_of(32) {
             return false;
@@ -262,6 +303,14 @@ impl RemoteBitfield {
         // Truncate at the end of the u64 bit space instead of overflowing.
         let end = start.saturating_add((words.len() as u64).saturating_mul(32));
         let mut remaining = (end - start) / 32 * 32;
+        if remaining > 0
+            && !self.reserve(
+                start / BITS_PER_PAGE,
+                (start + remaining - 1) / BITS_PER_PAGE,
+            )
+        {
+            return true;
+        }
         let mut word_offset = 0;
         let mut pos = start;
 
@@ -498,6 +547,30 @@ mod tests {
         // Caps the clear at the highest page, which saturates at the u64 bit space.
         bitfield.set_range(start, u64::MAX, false);
         assert!(!bitfield.get(start));
+    }
+
+    #[test]
+    fn page_budget_refuses_writes_without_allocating() {
+        let mut bitfield = RemoteBitfield::with_page_budget(4);
+        bitfield.set_range(1, 1 << 40, true);
+        assert_eq!(
+            bitfield.page_count(),
+            0,
+            "a range past the budget allocates nothing"
+        );
+        assert!(bitfield.over_budget());
+        assert!(!bitfield.get(1), "refused bits read as unset");
+
+        let mut bitfield = RemoteBitfield::with_page_budget(4);
+        bitfield.set_range(0, 3 * BITS_PER_PAGE, true);
+        bitfield.set(BITS_PER_PAGE, true);
+        assert!(!bitfield.over_budget(), "existing pages cost nothing");
+        bitfield.set(u64::MAX, true);
+        assert_eq!(bitfield.page_count(), 4);
+        assert!(bitfield.insert(1 << 50, &[1; 2048]), "aligned start");
+        assert_eq!(bitfield.page_count(), 4);
+        assert!(bitfield.over_budget());
+        assert!(!bitfield.get(1 << 50));
     }
 
     #[test]

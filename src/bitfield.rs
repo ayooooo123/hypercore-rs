@@ -60,7 +60,8 @@ impl Bitfield {
         }
     }
 
-    /// Rebuilds a bitfield from persisted `(page index, 4096-byte page)` pairs.
+    /// Rebuilds a bitfield from persisted `(page index, 4096-byte page)` pairs. A row of
+    /// another size loads like JS `buffer.set`: missing bytes stay zero, extra bytes are ignored.
     ///
     /// All-zero pages are dropped from memory; their segment allocation is kept
     /// so `want` output keeps the JS layout.
@@ -77,13 +78,11 @@ impl Bitfield {
     }
 
     fn insert_page(&mut self, page_index: u64, bytes: &[u8]) {
-        assert_eq!(
-            bytes.len(),
-            BYTES_PER_PAGE,
-            "bitfield page must be 4096 bytes"
-        );
+        let mut full = [0u8; BYTES_PER_PAGE];
+        let n = bytes.len().min(BYTES_PER_PAGE);
+        full[..n].copy_from_slice(&bytes[..n]);
         let page = self.ensure_page(page_index);
-        for (word, chunk) in page.words.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        for (word, chunk) in page.words.iter_mut().zip(full.as_chunks::<4>().0) {
             *word = u32::from_le_bytes(*chunk);
         }
         page.dirty = false;
@@ -591,6 +590,18 @@ mod tests {
 
     fn empty_page() -> Vec<u8> {
         vec![0; BYTES_PER_PAGE]
+    }
+
+    #[test]
+    fn short_or_long_page_loads_like_buffer_set() {
+        let mut long = vec![0u8; BYTES_PER_PAGE + 3];
+        long[0] = 0x01;
+        long[BYTES_PER_PAGE] = 0xff;
+        let bitfield = Bitfield::from_pages([(0, vec![0xff, 0x01]), (1, long)]);
+        assert!((0..9).all(|i| bitfield.get(i)));
+        assert!(!bitfield.get(9));
+        assert!(bitfield.get(BITS_PER_PAGE));
+        assert!(!bitfield.get(2 * BITS_PER_PAGE));
     }
 
     #[test]

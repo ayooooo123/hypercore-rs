@@ -274,8 +274,8 @@ async fn js_encrypted_core_and_its_fork_replicate_to_rust() {
     }
     assert_eq!(
         core.byte_length(),
-        20 * (1000 + 8),
-        "byte length counts the padding, as in JS"
+        20 * 1000,
+        "byte length excludes the padding, as JS `core.byteLength` does"
     );
 
     let stdin = child.stdin.as_mut().unwrap();

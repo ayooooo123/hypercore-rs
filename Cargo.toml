@@ -27,7 +27,7 @@ corestore-rs = { path = "../corestore-rs" }
 hyperbee-rs = { path = "../hyperbee-rs" }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1.40", features = ["full"] }
+tokio = { version = "1.40", features = ["full", "test-util"] }
 peeroxide-dht = "1.7.4"
 peeroxide = "1.7.4"
 sha2 = "0.10"

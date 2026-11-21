@@ -499,7 +499,8 @@ fn unpadded_size(node: &Node, padding: u64, ite: Option<&Iter>) -> u64 {
         return node.size;
     }
     let leaves = ite.map_or_else(|| flat_tree::count_leaves(node.index), Iter::count_leaves);
-    node.size - padding * leaves
+    // A signed block may be shorter than the padding, and a seek's padding is the peer's.
+    node.size.saturating_sub(padding.saturating_mul(leaves))
 }
 
 fn byte_offset_in(roots: &[Node], index: u64, get: &dyn Fn(u64) -> Result<Node>) -> Result<u64> {
@@ -596,7 +597,9 @@ pub fn seek(
 /// `ByteSeeker`'s `start`/`end`: the local block span a peer is asked about for `bytes`.
 /// At or past the local length it is `(length, 0)` — the JS replicator still sends the seek.
 pub fn seek_window(state: &TreeState, bytes: u64, padding: u64) -> (u64, u64) {
-    let size = state.byte_length - state.length * padding;
+    let size = state
+        .byte_length
+        .saturating_sub(state.length.saturating_mul(padding));
     if bytes >= size {
         (state.length, 0)
     } else {
@@ -767,6 +770,7 @@ fn verify_tree_cached(
     nodes: &mut Vec<Node>,
     known: &HashMap<u64, Node>,
 ) -> Result<Option<Node>> {
+    check_proof(proof)?;
     let untrusted = match (&proof.block, &proof.hash) {
         (Some(b), _) => Some((2 * b.index, Some(&b.value), &b.nodes[..])),
         (None, Some(h)) => Some((h.index, None, &h.nodes[..])),
@@ -780,7 +784,6 @@ fn verify_tree_cached(
     if untrusted.is_none() && seek_nodes.is_none() {
         return Ok(None);
     }
-
     let mut root = None;
     if let Some(seek_nodes) = seek_nodes {
         let mut ite = Iter::new(seek_nodes[0].index);
@@ -816,6 +819,7 @@ fn verify_tree_cached(
 }
 
 fn verify_upgrade(proof: &Data, block_root: Option<Node>, batch: &mut Batch) -> Result<bool> {
+    check_proof(proof)?;
     let upgrade = proof
         .upgrade
         .as_ref()
@@ -936,6 +940,20 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
         u.length = p.length;
     }
     let head = 2 * state.length;
+    let mut out = Data {
+        fork: state.fork,
+        ..Default::default()
+    };
+    if head == 0 {
+        return Ok(out);
+    }
+    // Out-of-range indexes fail in JS too (no such node); refuse them before any arithmetic.
+    if req.block.is_some_and(|b| b.index >= MAX_LENGTH)
+        || req.hash.is_some_and(|h| h.index >= MAX_INDEX)
+        || upgrade.is_some_and(|u| beyond_max_length(u.start, u.length))
+    {
+        return Err(invalid("Index is out of bounds"));
+    }
     let from = upgrade.map_or(0, |u| u.start * 2);
     let to = upgrade.map_or(head, |u| from + u.length * 2);
     let node = match (&req.block, &req.hash) {
@@ -954,13 +972,6 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
         _ => None,
     };
 
-    let mut out = Data {
-        fork: state.fork,
-        ..Default::default()
-    };
-    if head == 0 {
-        return Ok(out);
-    }
     if from >= to || to > head {
         return Err(invalid("Invalid upgrade"));
     }
@@ -1066,6 +1077,10 @@ pub fn proof(state: &TreeState, store: &impl NodeStore, req: &ProofRequest) -> R
 }
 
 fn nodes_to_root(index: u64, nodes: u64, head: u64) -> Result<u64> {
+    // A tree has at most 64 levels; JS reaches `head` within that many steps too.
+    if nodes > 64 {
+        return Err(invalid("Nodes is out of bounds"));
+    }
     let mut ite = Iter::new(index);
     for _ in 0..nodes {
         ite.parent();
@@ -1255,7 +1270,7 @@ fn seek_untrusted_tree(
 ) -> Result<u64> {
     let offset = byte_offset(state, store, root)?
         .checked_sub(if padding > 0 {
-            padding * flat_tree::left_span(root) / 2
+            padding.saturating_mul(flat_tree::left_span(root) / 2)
         } else {
             0
         })
@@ -1298,26 +1313,45 @@ pub fn missing_nodes(store: &impl NodeStore, index: u64, length: u64) -> Result<
     Ok(count)
 }
 
-/// `MerkleTree.maxMissingNodes`.
-pub fn max_missing_nodes(index: u64, length: u64) -> u64 {
-    let head = 2 * length;
-    let mut ite = Iter::new(index);
-    if ite.peek_right_span() >= head || flat_tree::full_roots(head).contains(&index) {
-        return 0;
-    }
-    ite.parent();
-    let mut cnt = 0;
-    while !ite.contains(head) {
-        cnt += 1;
-        ite.parent();
-    }
-    cnt
-}
-
 /// The largest length JS can represent (`2 ** 52`).
-const MAX_LENGTH: u64 = 1 << 52;
+pub(crate) const MAX_LENGTH: u64 = 1 << 52;
+/// One past the largest flat-tree index of a `MAX_LENGTH` tree.
+const MAX_INDEX: u64 = 2 * MAX_LENGTH;
 /// A proof needs at most two nodes per level of a 64-level tree.
 const MAX_NODES: usize = 2 * 64;
+
+/// Whether `[start, start + length)` reaches past `MAX_LENGTH`.
+pub(crate) fn beyond_max_length(start: u64, length: u64) -> bool {
+    start.checked_add(length).is_none_or(|end| end > MAX_LENGTH)
+}
+
+/// The one gate for peer-chosen proof geometry: no valid tree holds an index at or past
+/// `MAX_INDEX`, so refuse it before any `u64` tree arithmetic can overflow or spin.
+fn check_proof(proof: &Data) -> Result<()> {
+    let mut nodes = proof
+        .block
+        .iter()
+        .flat_map(|b| &b.nodes)
+        .chain(proof.hash.iter().flat_map(|h| &h.nodes))
+        .chain(proof.seek.iter().flat_map(|s| &s.nodes))
+        .chain(
+            proof
+                .upgrade
+                .iter()
+                .flat_map(|u| u.nodes.iter().chain(&u.additional_nodes)),
+        );
+    if proof.block.as_ref().is_some_and(|b| b.index >= MAX_LENGTH)
+        || proof.hash.as_ref().is_some_and(|h| h.index >= MAX_INDEX)
+        || proof
+            .upgrade
+            .as_ref()
+            .is_some_and(|u| beyond_max_length(u.start, u.length))
+        || nodes.any(|n| n.index >= MAX_INDEX)
+    {
+        return Err(MerkleError::InvalidProof("Index is out of bounds".into()));
+    }
+    Ok(())
+}
 
 /// Serves only the nodes a proof carries, noting any lookup it cannot answer.
 struct ProofNodes {
@@ -1339,6 +1373,7 @@ impl NodeStore for ProofNodes {
 /// another length as if requested from ours, using only the nodes it carries.
 /// `Ok(None)`: those nodes cannot bridge our length.
 pub fn refit(state: &TreeState, store: &impl NodeStore, proof: &Data) -> Result<Option<Data>> {
+    check_proof(proof)?;
     let Some(upgrade) = proof
         .upgrade
         .as_ref()

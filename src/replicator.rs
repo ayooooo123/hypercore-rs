@@ -5,6 +5,16 @@
 //! Not ported: push mode (`allowPush`), repair mode, extensions, block-list
 //! ranges and the 40+ peer update throttle. UDX inflight windows use the
 //! mux's live RTT provider; other transports retain the JS non-UDX limit.
+//!
+//! Deviations from npm, bounds against hostile peers: a wire `range` or `bitfield` is cut
+//! to the peer's synced length (nothing before its `sync`); each peer's two remote
+//! bitfields hold at most [`PEER_PAGE_BUDGET`] pages and a peer that needs more is
+//! disconnected; a peer parks at most [`MAX_REMOTE_REQUESTS`] requests, more are answered
+//! `noData` and count as invalid; `want`s are answered only while the mux is drained;
+//! one fork proof is in flight per peer and at most [`MAX_REORGS`] forks are tracked.
+//!
+//! `CoreEvent::Download` reaches subscribers through the core's bounded event channel: a
+//! subscriber more than 256 events behind loses events (JS emits each one synchronously).
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -14,10 +24,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use compact_encoding::hypercore::{
-    Bitfield as WireBitfield, Cancel, Data, Extension, Handshake, NoData, Range, Request,
-    RequestBlock, RequestSeek, RequestUpgrade, Sync, Want,
+    Bitfield as WireBitfield, Cancel, Data, Handshake, NoData, Range, Request, RequestBlock,
+    RequestSeek, RequestUpgrade, Sync, Want,
 };
-use compact_encoding::{Bytes, Codec, Reader, decode, encode};
+use compact_encoding::{Bytes, Codec, decode, encode};
 use protomux::{ChannelOptions, ChannelSender, Event, Mux, PairRequest};
 use rand::Rng;
 use rand::seq::SliceRandom;
@@ -42,6 +52,17 @@ const INVALID_REQUEST: u64 = 2;
 const MAX_INVALID_REQUESTS: u64 = 64;
 const MAX_BACKOFFS: u64 = MAX_INVALID_REQUESTS / 2;
 const PAGE_BITS: u64 = 32768;
+/// Requests one peer may have parked or in progress (JS: unbounded); JS's largest
+/// inflight window. More are answered `noData{INVALID_REQUEST}` and count as invalid.
+const MAX_REMOTE_REQUESTS: usize = 512;
+/// `want`s parked while the mux is not drained (JS answers at once); more are dropped.
+const MAX_PARKED_WANTS: usize = 512;
+/// Forks tracked at once (JS: unbounded).
+const MAX_REORGS: usize = 16;
+/// Pages each of a peer's `remote_bitfield` and `missing_blocks` may hold (JS: unbounded):
+/// 1024 pages of 32768 bits, 4 MiB, describe 33.5 million blocks, 16 TiB of 512 KiB blobs.
+/// Ranges from 0 use `remote_contiguous` and cost no page.
+const PEER_PAGE_BUDGET: u64 = 1024;
 
 const PRIORITY_NORMAL: u64 = 0;
 const PRIORITY_HIGH: u64 = 1;
@@ -56,11 +77,11 @@ const MSG_WANT: u64 = 5;
 const MSG_UNWANT: u64 = 6;
 const MSG_BITFIELD: u64 = 7;
 const MSG_RANGE: u64 = 8;
-const MSG_EXTENSION: u64 = 9;
 
 type PeerId = usize;
 type ReqId = u64;
 type WaiterId = u64;
+type BoolReply = oneshot::Sender<Result<bool, CoreError>>;
 
 #[derive(Debug)]
 enum Wire {
@@ -73,10 +94,9 @@ enum Wire {
     Unwant(Want),
     Bitfield(WireBitfield),
     Range(Range),
-    #[allow(dead_code)]
-    Extension(Extension),
 }
 
+/// Extensions (kind 9) are not ported, so they are skipped like unknown kinds.
 fn decode_wire(kind: u64, data: Bytes) -> Result<Option<Wire>, compact_encoding::Error> {
     Ok(Some(match kind {
         MSG_SYNC => Wire::Sync(decode(data)?),
@@ -88,7 +108,6 @@ fn decode_wire(kind: u64, data: Bytes) -> Result<Option<Wire>, compact_encoding:
         MSG_UNWANT => Wire::Unwant(decode(data)?),
         MSG_BITFIELD => Wire::Bitfield(decode(data)?),
         MSG_RANGE => Wire::Range(decode(data)?),
-        MSG_EXTENSION => Wire::Extension(Extension::decode(&mut Reader::new(data))?),
         _ => return Ok(None),
     }))
 }
@@ -115,22 +134,30 @@ enum Cmd {
     Drained {
         peer: PeerId,
     },
+    /// The proof built off the actor for `peer`'s request `seq`.
+    Proof {
+        peer: PeerId,
+        seq: u64,
+        request: Request,
+        proof: Box<Result<Data, CoreError>>,
+    },
+    /// The not-downloading linger of this generation ran out.
+    NotDownloading(u64),
     GetBlock {
         index: u64,
-        force: bool,
         waiter: WaiterId,
         reply: oneshot::Sender<Result<Bytes, CoreError>>,
     },
     Upgrade {
         waiter: WaiterId,
-        reply: oneshot::Sender<bool>,
+        reply: BoolReply,
     },
     Range {
         start: u64,
         end: Option<u64>,
         linear: bool,
         waiter: WaiterId,
-        reply: oneshot::Sender<bool>,
+        reply: BoolReply,
     },
     Seek {
         bytes: u64,
@@ -138,7 +165,7 @@ enum Cmd {
         start: u64,
         end: u64,
         waiter: WaiterId,
-        reply: oneshot::Sender<bool>,
+        reply: BoolReply,
     },
     Cancel(WaiterId),
     SyncActive,
@@ -301,16 +328,17 @@ impl Replicator {
         self.send(Cmd::Attach(mux.clone(), requests, pairing));
     }
 
+    /// `_force`: the core reads a forced block itself; the replicator applies the same
+    /// upgrade checks to every request, as JS does without push mode.
     pub(crate) fn request_block(
         &self,
         index: u64,
-        force: bool,
+        _force: bool,
     ) -> impl Future<Output = Result<Bytes, CoreError>> + use<> {
         let (reply, rx) = oneshot::channel();
         let waiter = self.waiter();
         self.send(Cmd::GetBlock {
             index,
-            force,
             waiter,
             reply,
         });
@@ -337,7 +365,7 @@ impl Replicator {
         let waiter = self.waiter();
         self.send(Cmd::Upgrade { waiter, reply });
         let p = self.pending(rx, waiter);
-        async move { p.await.ok_or(CoreError::Closed) }
+        async move { p.await.unwrap_or(Err(CoreError::Closed)) }
     }
 
     pub(crate) fn request_range(
@@ -356,7 +384,7 @@ impl Replicator {
             reply,
         });
         let p = self.pending(rx, waiter);
-        async move { p.await.ok_or(CoreError::Closed) }
+        async move { p.await.unwrap_or(Err(CoreError::Closed)) }
     }
 
     pub(crate) fn request_seek(
@@ -377,7 +405,7 @@ impl Replicator {
             reply,
         });
         let p = self.pending(rx, waiter);
-        async move { p.await.ok_or(CoreError::Closed) }
+        async move { p.await.unwrap_or(Err(CoreError::Closed)) }
     }
 
     pub(crate) async fn pending_requests(&self) -> usize {
@@ -525,7 +553,6 @@ struct BlockReq {
     inflight: Vec<ReqId>,
     queued: bool,
     hotswap: Option<(usize, usize)>,
-    force: bool,
     waiters: Vec<(WaiterId, oneshot::Sender<Result<Bytes, CoreError>>)>,
 }
 
@@ -533,7 +560,7 @@ struct UpgradeReq {
     fork: u64,
     length: u64,
     inflight: Vec<ReqId>,
-    waiters: Vec<(WaiterId, oneshot::Sender<bool>)>,
+    waiters: Vec<(WaiterId, BoolReply)>,
 }
 
 struct SeekReq {
@@ -543,7 +570,7 @@ struct SeekReq {
     start: u64,
     end: u64,
     inflight: Vec<ReqId>,
-    waiters: Vec<(WaiterId, oneshot::Sender<bool>)>,
+    waiters: Vec<(WaiterId, BoolReply)>,
 }
 
 struct RangeReq {
@@ -554,7 +581,7 @@ struct RangeReq {
     user_start: u64,
     user_end: Option<u64>,
     batches: Vec<u64>,
-    waiters: Vec<(WaiterId, oneshot::Sender<bool>)>,
+    waiters: Vec<(WaiterId, BoolReply)>,
 }
 
 struct ForkReq {
@@ -579,7 +606,16 @@ struct Peer {
     paused: bool,
     removed: bool,
     block_roundtrip: f64,
-    receiver_queue: VecDeque<Request>,
+    /// Parked request ids with their arrival sequence (JS `ReceiverQueue`): FIFO for
+    /// normal priority, last in first out for high priority. Entries whose sequence no
+    /// longer matches `remote_requests` were cancelled or replaced and are skipped.
+    receiver_queue: VecDeque<(u64, u64)>,
+    receiver_priority: Vec<(u64, u64)>,
+    /// Sequence of the request whose proof is being built off the actor.
+    proving: Option<u64>,
+    /// The mux is corked for a run of answers (JS `_handleRequests`).
+    answering: bool,
+    parked_wants: VecDeque<Want>,
     roundtrip_queue: Option<RoundtripQueue>,
     can_upgrade: bool,
     last_upgradable_length: u64,
@@ -595,7 +631,7 @@ struct Peer {
     remote_downloading: bool,
     remote_synced: bool,
     remote_has_manifest: bool,
-    remote_requests: HashMap<u64, Request>,
+    remote_requests: HashMap<u64, (u64, Request)>,
     wants: LocalWants<Handle>,
     remote_wants: RemoteWants,
     length_acked: u64,
@@ -633,6 +669,44 @@ impl Peer {
     fn send<T: Codec>(&mut self, kind: u64, msg: &T) -> bool {
         self.tx.send(kind, msg)
     }
+
+    /// The end of what this peer may describe: nothing before its `sync`, then up to the
+    /// longer of its length and ours.
+    fn wire_bound(&self, local_length: u64) -> u64 {
+        if self.remote_synced {
+            self.remote_length.max(local_length)
+        } else {
+            0
+        }
+    }
+
+    /// JS `ReceiverQueue.shift`: the next live parked request.
+    fn next_request(&mut self) -> Option<(u64, Request)> {
+        loop {
+            let (id, seq) = match self.receiver_priority.pop() {
+                Some(e) => e,
+                None => self.receiver_queue.pop_front()?,
+            };
+            if let Some((s, m)) = self.remote_requests.get(&id)
+                && *s == seq
+            {
+                return Some((seq, m.clone()));
+            }
+        }
+    }
+
+    /// Drops queue entries of cancelled or replaced requests.
+    fn compact_requests(&mut self) {
+        let Self {
+            remote_requests,
+            receiver_queue,
+            receiver_priority,
+            ..
+        } = self;
+        let live = |&(id, seq): &(u64, u64)| remote_requests.get(&id).is_some_and(|e| e.0 == seq);
+        receiver_queue.retain(live);
+        receiver_priority.retain(live);
+    }
 }
 
 struct Actor {
@@ -654,10 +728,13 @@ struct Actor {
     downloading: bool,
     active: bool,
     had_peers: bool,
-    /// JS `replicator.findingPeers` (live) and `_foundPeers`: a core nobody has replicated yet
-    /// keeps an update waiting while guards are held, and concludes once they are released.
+    /// JS `replicator.findingPeers` (live): while a guard is held, a core nobody has
+    /// replicated yet keeps an update waiting.
     finding_peers: Arc<std::sync::atomic::AtomicUsize>,
-    found_peers: bool,
+    /// Generation of the not-downloading linger timer (JS `_notDownloadingTimer`).
+    linger: u64,
+    /// JS `NOT_DOWNLOADING_SLACK`: 20 to 40 s.
+    not_downloading_slack: Duration,
     if_available: i64,
     manifest_peer: Option<PeerId>,
     attached: Vec<Mux>,
@@ -723,7 +800,10 @@ impl Actor {
             downloading: false,
             active: false,
             had_peers: false,
-            found_peers: false,
+            linger: 0,
+            not_downloading_slack: Duration::from_millis(
+                rand::thread_rng().gen_range(20_000..40_000),
+            ),
             if_available: 0,
             manifest_peer: None,
             attached: vec![],
@@ -769,14 +849,17 @@ impl Actor {
                     peer,
                     msg: Wire::Data(d),
                 } if is_plain_block(&d, core.fork()) => {
-                    // Coalesce queued block answers into one storage commit.
+                    // Coalesce this peer's queued block answers into one storage commit, so
+                    // each `Download` names the peer that sent it.
                     let mut batch = vec![(peer, *d)];
                     while batch.len() < 64 {
                         match rx.try_recv() {
                             Ok(Cmd::Wire {
-                                peer,
+                                peer: next,
                                 msg: Wire::Data(d),
-                            }) if is_plain_block(&d, core.fork()) => batch.push((peer, *d)),
+                            }) if next == peer && is_plain_block(&d, core.fork()) => {
+                                batch.push((next, *d))
+                            }
                             Ok(other) => {
                                 deferred.push_back(other);
                                 break;
@@ -795,6 +878,9 @@ impl Actor {
             }
         }
         for p in self.peers.iter().flatten() {
+            if p.answering {
+                p.mux.uncork();
+            }
             p.tx.close();
         }
         for mux in &self.attached {
@@ -830,19 +916,35 @@ impl Actor {
                 if let Some(p) = self.peer_mut(peer) {
                     p.drain_pending = false;
                 }
+                self.answer_wants(core, peer);
                 self.handle_requests(core, peer);
+            }
+            Cmd::Proof {
+                peer,
+                seq,
+                request,
+                proof,
+            } => {
+                if let Some(p) = self.peer_mut(peer)
+                    && p.proving == Some(seq)
+                {
+                    p.proving = None;
+                    self.answer_request(core, peer, seq, &request, (*proof).map(Some));
+                    self.handle_requests(core, peer);
+                }
+            }
+            Cmd::NotDownloading(generation) => {
+                if generation == self.linger {
+                    self.set_downloading_now(core, false);
+                }
             }
             Cmd::GetBlock {
                 index,
-                force,
                 waiter,
                 reply,
-            } => self.add_block(core, index, force, waiter, reply),
+            } => self.add_block(core, index, waiter, reply),
             Cmd::Upgrade { waiter, reply } => self.add_upgrade(core, waiter, reply),
-            Cmd::FindingPeersReleased => {
-                self.found_peers = true;
-                self.check_upgrade_if_available(core);
-            }
+            Cmd::FindingPeersReleased => self.check_upgrade_if_available(core),
             Cmd::Range {
                 start,
                 end,
@@ -879,17 +981,33 @@ impl Actor {
                 self.update_all(core);
             }
             Cmd::Appended { start, length } => {
+                let muxes = self.cork_peers();
                 self.on_upgrade(core);
                 self.on_have(core, start, length, false);
+                muxes.iter().for_each(Mux::uncork);
             }
             Cmd::Truncated { start, length } => {
+                let muxes = self.cork_peers();
                 self.on_truncate(core, start, length);
                 self.on_have(core, start, length, true);
                 self.on_upgrade(core);
+                muxes.iter().for_each(Mux::uncork);
             }
             Cmd::Cleared { start, length } => self.on_have(core, start, length, true),
             Cmd::Destroy => self.destroyed = true,
         }
+    }
+
+    /// JS `replicator.cork()`: corks every open peer's mux; uncork the returned ones.
+    fn cork_peers(&self) -> Vec<Mux> {
+        let muxes: Vec<Mux> = self
+            .order
+            .iter()
+            .filter_map(|&id| self.peer(id))
+            .map(|p| p.mux.clone())
+            .collect();
+        muxes.iter().for_each(Mux::cork);
+        muxes
     }
 
     fn next_id(&mut self) -> u64 {
@@ -983,14 +1101,18 @@ impl Actor {
             removed: false,
             block_roundtrip: 0.0,
             receiver_queue: VecDeque::new(),
+            receiver_priority: vec![],
+            proving: None,
+            answering: false,
+            parked_wants: VecDeque::new(),
             roundtrip_queue: None,
             can_upgrade: true,
             last_upgradable_length: 0,
             last_upgradable_fork: 0,
             remote_contiguous: 0,
             remote_opened: false,
-            remote_bitfield: RemoteBitfield::new(),
-            missing_blocks: RemoteBitfield::new(),
+            remote_bitfield: RemoteBitfield::with_page_budget(PEER_PAGE_BUDGET),
+            missing_blocks: RemoteBitfield::with_page_budget(PEER_PAGE_BUDGET),
             remote_fork: 0,
             remote_length: 0,
             remote_can_upgrade: false,
@@ -1061,12 +1183,23 @@ impl Actor {
         let Some(p) = self.peer_mut(id) else { return };
         let reopen = remote && p.remote_opened && !p.remote_downloading && p.remote_uploading;
         let mux = p.mux.clone();
-        if !p.remote_opened {
+        let opened = p.remote_opened;
+        if std::mem::take(&mut p.answering) {
+            mux.uncork();
+        }
+        // Ids that cancelled requests still reserve go back to the free list (JS `onclose`).
+        if let Some(q) = p.roundtrip_queue.take() {
+            self.inflight
+                .free
+                .extend(q.queue.into_iter().map(|(_, rid)| rid));
+        }
+        if !opened {
             self.peers[id] = None;
             self.if_available -= 1;
             self.update_all(core);
             return;
         }
+        let p = self.peer_mut(id).expect("peer");
         p.remote_opened = false;
         p.removed = true;
         p.wants.destroy();
@@ -1240,14 +1373,14 @@ impl Actor {
             return;
         }
         let contig = st.tree.length.min(st.header.contiguous_length);
-        if start + length < contig {
+        if start.saturating_add(length) < contig {
             p.missing_blocks.set_range(start, contig, false);
             return;
         }
         let rem = start & (PAGE_BITS - 1);
         start -= rem;
-        length += rem;
-        let end = start + length.min(st.tree.length);
+        length = length.saturating_add(rem);
+        let end = start.saturating_add(length.min(st.tree.length));
         while start < end {
             if let Some(words) = st.bitfield.page_words(start) {
                 p.missing_blocks.clear(start, words);
@@ -1273,9 +1406,9 @@ impl Actor {
         let Some(p) = self.peer_mut(id) else { return };
         let rem = start & (seg - 1);
         start -= rem;
-        length += rem;
+        length = length.saturating_add(rem);
         let fixed = start;
-        let end = start + length.min(p.remote_length);
+        let end = start.saturating_add(length.min(p.remote_length));
         for (s, words) in p.remote_bitfield.pages_in(start, end) {
             p.missing_blocks.insert(s, words);
         }
@@ -1328,22 +1461,29 @@ impl Actor {
         }
     }
 
+    /// JS `setDownloading`: activity starts downloading at once; inactivity stops it after
+    /// the not-downloading linger, so a short gap between sessions keeps the channels and
+    /// the wants of every peer.
     fn set_active(&mut self, core: &Core, active: bool) {
         if self.active == active {
             return;
         }
         self.active = active;
-        if !active {
-            for peer in self.peers.iter_mut().flatten() {
-                for want in peer.wants.clear() {
-                    peer.send(MSG_UNWANT, &want);
-                }
-            }
-        }
-        self.set_downloading_now(core, active);
+        self.linger += 1;
         if active {
+            self.set_downloading_now(core, true);
             self.update_all(core);
+            return;
         }
+        let generation = self.linger;
+        let delay = self.not_downloading_slack;
+        let tx = self.tx.downgrade();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(tx) = tx.upgrade() {
+                let _ = tx.send(Cmd::NotDownloading(generation));
+            }
+        });
     }
 
     fn set_downloading_now(&mut self, core: &Core, downloading: bool) {
@@ -1386,7 +1526,6 @@ impl Actor {
         &mut self,
         core: &Core,
         index: u64,
-        force: bool,
         waiter: WaiterId,
         reply: oneshot::Sender<Result<Bytes, CoreError>>,
     ) {
@@ -1399,7 +1538,6 @@ impl Actor {
             inflight: vec![],
             queued: false,
             hotswap: None,
-            force,
             waiters: vec![],
         });
         b.waiters.push((waiter, reply));
@@ -1410,7 +1548,7 @@ impl Actor {
         self.update_all(core);
     }
 
-    fn add_upgrade(&mut self, core: &Core, waiter: WaiterId, reply: oneshot::Sender<bool>) {
+    fn add_upgrade(&mut self, core: &Core, waiter: WaiterId, reply: BoolReply) {
         let fresh = self.upgrade.is_none();
         self.ensure_upgrade(core).waiters.push((waiter, reply));
         if fresh {
@@ -1440,7 +1578,7 @@ impl Actor {
         end: Option<u64>,
         linear: bool,
         waiter: WaiterId,
-        reply: oneshot::Sender<bool>,
+        reply: BoolReply,
     ) {
         let id = self.next_id();
         let mut r = RangeReq {
@@ -1456,7 +1594,7 @@ impl Actor {
         clamp_range(core, &mut r);
         if r.end.is_some_and(|e| r.start >= e) {
             for (_, w) in r.waiters {
-                let _ = w.send(true);
+                let _ = w.send(Ok(true));
             }
             return;
         }
@@ -1806,7 +1944,7 @@ impl Actor {
         }
         let u = self.upgrade.take().expect("upgrade");
         for (_, w) in u.waiters {
-            let _ = w.send(true);
+            let _ = w.send(Ok(true));
         }
         true
     }
@@ -1817,13 +1955,12 @@ impl Actor {
         }
         let Some(u) = &self.upgrade else { return };
         // JS: an update does not conclude before the first peer arrives while the caller is
-        // still finding peers; releasing the last guard concludes it. Without a guard the
-        // port keeps waiting for the first peer at all, as it always has.
+        // still finding peers; without a guard it concludes at once.
         let finding = self
             .finding_peers
             .load(std::sync::atomic::Ordering::Acquire)
             > 0;
-        if u.waiters.is_empty() || !self.had_peers && (finding || !self.found_peers) {
+        if u.waiters.is_empty() || !self.had_peers && finding {
             return;
         }
         let (length, fork) = {
@@ -1856,11 +1993,11 @@ impl Actor {
         }
         let u = self.upgrade.take().expect("upgrade");
         for (_, w) in u.waiters {
-            let _ = w.send(false);
+            let _ = w.send(Ok(false));
         }
     }
 
-    fn should_upgrade(&self, core: &Core, p: &Peer) -> bool {
+    fn should_upgrade(&self, length: u64, p: &Peer) -> bool {
         if self
             .upgrade
             .as_ref()
@@ -1868,12 +2005,11 @@ impl Actor {
         {
             return false;
         }
-        let length = core.length();
         p.remote_can_upgrade && p.remote_length > length && p.length_acked == length
     }
 
-    fn auto_upgrade(&self, core: &Core, p: &Peer) -> bool {
-        self.upgrade.is_some() && p.remote_fork == core.fork() && self.should_upgrade(core, p)
+    fn auto_upgrade(&self, core: &Core, length: u64, p: &Peer) -> bool {
+        self.upgrade.is_some() && p.remote_fork == core.fork() && self.should_upgrade(length, p)
     }
 
     // Incoming wire messages
@@ -1883,9 +2019,9 @@ impl Actor {
             Wire::Sync(m) => self.on_sync(core, id, m),
             Wire::Request(m) => self.on_request(core, id, m),
             Wire::Cancel(m) => {
+                // Its queue entry no longer matches and is skipped.
                 if let Some(p) = self.peer_mut(id) {
                     p.remote_requests.remove(&m.request);
-                    p.receiver_queue.retain(|r| r.id != m.request);
                 }
             }
             Wire::Data(m) => self.on_data(core, id, *m).await,
@@ -1903,7 +2039,6 @@ impl Actor {
             }
             Wire::Bitfield(m) => self.on_bitfield(core, id, m),
             Wire::Range(m) => self.on_range(core, id, m),
-            Wire::Extension(_) => {}
         }
     }
 
@@ -1954,16 +2089,36 @@ impl Actor {
     }
 
     fn on_request(&mut self, core: &Core, id: PeerId, m: Request) {
+        let seq = self.next_id();
         let Some(p) = self.peer_mut(id) else { return };
-        if p.remote_requests.insert(m.id, m.clone()).is_some() {
-            p.receiver_queue.retain(|r| r.id != m.id);
-        }
-        if !p.mux.is_drained() || !p.receiver_queue.is_empty() {
-            p.receiver_queue.push_back(m);
-            self.wait_drain(id);
+        if p.remote_requests.len() >= MAX_REMOTE_REQUESTS && !p.remote_requests.contains_key(&m.id)
+        {
+            // Not in JS: a peer parks at most one inflight window of requests.
+            p.invalid_requests += 1;
+            if p.invalid_requests >= MAX_INVALID_REQUESTS {
+                p.mux.destroy();
+                return;
+            }
+            p.send(
+                MSG_NO_DATA,
+                &NoData {
+                    request: m.id,
+                    reason: INVALID_REQUEST,
+                },
+            );
             return;
         }
-        self.handle_request(core, id, m);
+        // A request that reuses a parked id replaces it (JS `_cancel` and re-add).
+        if m.priority > 0 {
+            p.receiver_priority.push((m.id, seq));
+        } else {
+            p.receiver_queue.push_back((m.id, seq));
+        }
+        p.remote_requests.insert(m.id, (seq, m));
+        if p.receiver_queue.len() + p.receiver_priority.len() > 2 * MAX_REMOTE_REQUESTS {
+            p.compact_requests();
+        }
+        self.handle_requests(core, id);
     }
 
     fn wait_drain(&mut self, id: PeerId) {
@@ -1980,30 +2135,43 @@ impl Actor {
         });
     }
 
+    /// `_handleRequests`: answers parked requests in arrival order while the mux drains.
+    /// Proofs are built off the actor, one per peer at a time, and the mux stays corked for
+    /// the whole run of answers.
     fn handle_requests(&mut self, core: &Core, id: PeerId) {
-        let Some(p) = self.peer(id) else { return };
-        let mux = p.mux.clone();
-        mux.cork();
-        while let Some(p) = self.peer_mut(id) {
+        loop {
+            let Some(p) = self.peer_mut(id) else { return };
+            if p.proving.is_some() {
+                return;
+            }
             if !p.remote_opened || p.removed {
                 break;
             }
-            if !mux.is_drained() {
+            if !p.mux.is_drained() {
                 self.wait_drain(id);
                 break;
             }
-            // Priority requests first, as ReceiverQueue does.
-            let next = match p.receiver_queue.iter().position(|r| r.priority > 0) {
-                Some(i) => p.receiver_queue.remove(i),
-                None => p.receiver_queue.pop_front(),
+            let Some((seq, m)) = p.next_request() else {
+                break;
             };
-            let Some(m) = next else { break };
-            self.handle_request(core, id, m);
+            if !p.answering {
+                p.answering = true;
+                p.mux.cork();
+            }
+            if self.handle_request(core, id, seq, m) {
+                return;
+            }
         }
-        mux.uncork();
+        if let Some(p) = self.peer_mut(id)
+            && std::mem::take(&mut p.answering)
+        {
+            p.mux.uncork();
+        }
     }
 
-    fn handle_request(&mut self, core: &Core, id: PeerId, m: Request) {
+    /// Answers `m` at once, or starts building its proof on a blocking thread (true); the
+    /// proof comes back as `Cmd::Proof`.
+    fn handle_request(&mut self, core: &Core, id: PeerId, seq: u64, m: Request) -> bool {
         let (fork, has_block) = {
             let st = core.state();
             (
@@ -2011,22 +2179,48 @@ impl Actor {
                 m.block.is_some_and(|b| st.bitfield.get(b.index)),
             )
         };
-        let req = ProofRequest {
-            block: m.block,
-            hash: m.hash,
-            seek: m.seek,
-            upgrade: m.upgrade,
+        if m.fork != fork || (m.block.is_some() && !has_block) {
+            self.answer_request(core, id, seq, &m, Ok(None));
+            return false;
+        }
+        let Some(p) = self.peer_mut(id) else {
+            return false;
         };
-        let proof = if m.fork != fork || (m.block.is_some() && !has_block) {
-            Ok(None)
-        } else {
-            core.proof_for(&req, m.manifest).map(Some)
-        };
+        p.proving = Some(seq);
+        let (core, tx) = (core.clone(), self.tx.clone());
+        tokio::task::spawn_blocking(move || {
+            let req = ProofRequest {
+                block: m.block,
+                hash: m.hash,
+                seek: m.seek,
+                upgrade: m.upgrade,
+            };
+            let proof = core.proof_for(&req, m.manifest);
+            let _ = tx.send(Cmd::Proof {
+                peer: id,
+                seq,
+                request: m,
+                proof: Box::new(proof),
+            });
+        });
+        true
+    }
+
+    fn answer_request(
+        &mut self,
+        core: &Core,
+        id: PeerId,
+        seq: u64,
+        m: &Request,
+        proof: Result<Option<Data>, CoreError>,
+    ) {
+        let fork = core.fork();
         let Some(p) = self.peer_mut(id) else { return };
-        if p.remote_requests.get(&m.id) != Some(&m) {
+        if p.remote_requests.get(&m.id).is_none_or(|e| e.0 != seq) {
             return; // cancelled meanwhile
         }
         p.remote_requests.remove(&m.id);
+        let request = m.id;
         match proof {
             Err(_) => {
                 p.invalid_requests += 1;
@@ -2042,7 +2236,7 @@ impl Actor {
                     tx.send(
                         MSG_NO_DATA,
                         &NoData {
-                            request: m.id,
+                            request,
                             reason: INVALID_REQUEST,
                         },
                     );
@@ -2054,7 +2248,7 @@ impl Actor {
                 match manifest {
                     Some(manifest) => {
                         let d = Data {
-                            request: m.id,
+                            request,
                             fork,
                             manifest: Some(manifest),
                             ..Default::default()
@@ -2065,7 +2259,7 @@ impl Actor {
                         p.send(
                             MSG_NO_DATA,
                             &NoData {
-                                request: m.id,
+                                request,
                                 reason: NOT_AVAILABLE,
                             },
                         );
@@ -2078,7 +2272,7 @@ impl Actor {
                 if !p.is_active(frozen) && data.block.is_some() {
                     return;
                 }
-                data.request = m.id;
+                data.request = request;
                 data.fork = m.fork;
                 if !p.send(MSG_DATA, &data) {
                     self.wait_drain(id);
@@ -2087,13 +2281,71 @@ impl Actor {
         }
     }
 
+    /// JS `replicator.onconflict` and the `closeAllSessions(err)` that follows it: every
+    /// peer gets our upgrade proof and its channel closes; every waiting read fails with
+    /// `Conflict`. The core emits the conflict event itself.
+    fn on_conflict(&mut self, core: &Core) {
+        let (fork, length) = {
+            let st = core.state();
+            (st.tree.fork, st.tree.length)
+        };
+        for id in self.order.clone() {
+            let Some(p) = self.peer_mut(id) else { continue };
+            p.mux.cork();
+            if p.remote_length > 0 && p.remote_fork == fork {
+                let req = ProofRequest {
+                    block: None,
+                    hash: None,
+                    seek: None,
+                    upgrade: Some(RequestUpgrade {
+                        start: 0,
+                        length: length.min(p.remote_length),
+                    }),
+                };
+                if let Ok(mut data) = core.proof_for(&req, false) {
+                    data.request = 0;
+                    data.fork = fork;
+                    p.send(MSG_DATA, &data);
+                }
+            }
+            p.tx.close();
+            p.mux.uncork();
+        }
+        for (_, b) in std::mem::take(&mut self.blocks) {
+            for (_, w) in b.waiters {
+                let _ = w.send(Err(CoreError::Conflict));
+            }
+        }
+        self.queued.clear();
+        self.hotswaps = Default::default();
+        let seeks = std::mem::take(&mut self.seeks)
+            .into_iter()
+            .flat_map(|s| s.waiters);
+        let ranges = std::mem::take(&mut self.ranges)
+            .into_iter()
+            .flat_map(|r| r.waiters);
+        let upgrade = self.upgrade.take().into_iter().flat_map(|u| u.waiters);
+        for (_, w) in seeks.chain(ranges).chain(upgrade) {
+            let _ = w.send(Err(CoreError::Conflict));
+        }
+    }
+
     async fn on_data(&mut self, core: &Core, id: PeerId, data: Data) {
         if data.request == 0 && data.upgrade.as_ref().is_some_and(|u| u.start == 0) {
-            if core.check_conflict(&data).await.unwrap_or(true) {
-                return;
-            }
-            if let Some(p) = self.peer_mut(id) {
-                p.paused = false;
+            match core.check_conflict(&data).await {
+                Ok(false) => {
+                    if let Some(p) = self.peer_mut(id) {
+                        p.paused = false;
+                    }
+                }
+                Ok(true) => {
+                    // True also for an invalid proof; only a frozen core has a conflict.
+                    if Self::frozen(core) {
+                        self.on_conflict(core);
+                    }
+                    return;
+                }
+                Err(_) => return,
             }
         }
         let rid = (data.request > 0)
@@ -2116,6 +2368,9 @@ impl Actor {
                 if let Some(p) = self.peer_mut(id) {
                     p.paused = true;
                 }
+            } else {
+                // The peer's fork proof slot is free: ask for a newer fork it announced.
+                self.update_fork(core, id);
             }
             return;
         }
@@ -2145,6 +2400,13 @@ impl Actor {
             Ok(None) => self.on_no_data_inner(core, id, rid, req.as_ref(), 0),
             Err(e) => {
                 self.unmark_block_request(core, req.as_ref(), &data);
+                // JS `WRITE_FAILED`: a local storage fault is not the peer's; stop pulling.
+                if matches!(e, CoreError::Storage(_)) {
+                    if let Some(p) = self.peer_mut(id) {
+                        p.paused = true;
+                    }
+                    return;
+                }
                 let invalid_op = matches!(
                     e,
                     CoreError::Merkle(merkle::MerkleError::InvalidOperation(_))
@@ -2176,7 +2438,7 @@ impl Actor {
             }
         }
         let proofs: Vec<Data> = ok.iter().map(|x| x.3.clone()).collect();
-        // One peer per message: every proof in a batch comes from the same channel.
+        // `run` batches the answers of one peer only.
         let from = ok
             .first()
             .and_then(|(id, ..)| self.peer(*id))
@@ -2322,7 +2584,36 @@ impl Actor {
         self.update_all(core);
     }
 
+    /// Not in JS: a `want` is answered only while the mux is drained, so a peer cannot grow
+    /// our write queue with whole-segment bitfields; the rest wait for the drain.
     fn on_want(&mut self, core: &Core, id: PeerId, w: Want) {
+        let Some(p) = self.peer_mut(id) else { return };
+        if !p.mux.is_drained() || !p.parked_wants.is_empty() {
+            if p.parked_wants.len() < MAX_PARKED_WANTS {
+                p.parked_wants.push_back(w);
+            }
+            self.wait_drain(id);
+            return;
+        }
+        self.answer_want(core, id, w);
+    }
+
+    fn answer_wants(&mut self, core: &Core, id: PeerId) {
+        while let Some(p) = self.peer_mut(id) {
+            if !p.mux.is_drained() {
+                if !p.parked_wants.is_empty() {
+                    self.wait_drain(id);
+                }
+                return;
+            }
+            let Some(w) = p.parked_wants.pop_front() else {
+                return;
+            };
+            self.answer_want(core, id, w);
+        }
+    }
+
+    fn answer_want(&mut self, core: &Core, id: PeerId, w: Want) {
         let frozen = Self::frozen(core);
         let st = core.state();
         let contig = st.tree.length.min(st.header.contiguous_length);
@@ -2333,7 +2624,10 @@ impl Actor {
         if !p.is_active(frozen) {
             return;
         }
-        if w.start + w.length < contig || length == contig || (w.any && w.start < contig) {
+        if w.start.saturating_add(w.length) < contig
+            || length == contig
+            || (w.any && w.start < contig)
+        {
             p.send(
                 MSG_RANGE,
                 &Range {
@@ -2344,7 +2638,7 @@ impl Actor {
             );
             return;
         }
-        let len = w.length.min(length.saturating_sub(w.start));
+        let len = clamp_length(w.start, w.length, length);
         if w.any {
             if let Some(bit) = st
                 .bitfield
@@ -2374,21 +2668,33 @@ impl Actor {
     }
 
     fn on_bitfield(&mut self, core: &Core, id: PeerId, m: WireBitfield) {
+        let local_length = core.length();
         let Some(p) = self.peer_mut(id) else { return };
+        // Not in JS: words past what the peer can hold are dropped.
+        let bits = clamp_length(
+            m.start,
+            m.bitfield.len() as u64 * 32,
+            p.wire_bound(local_length),
+        );
+        let words = &m.bitfield[..bits.div_ceil(32) as usize];
         if m.start < p.remote_contiguous {
             p.remote_contiguous = m.start;
         }
-        p.remote_bitfield.insert(m.start, &m.bitfield);
-        p.missing_blocks.insert(m.start, &m.bitfield);
-        p.remote_contiguous = p.remote_contiguous_length();
-        let bits = m.bitfield.len() as u64 * 32;
+        p.remote_bitfield.insert(m.start, words);
+        p.missing_blocks.insert(m.start, words);
+        p.remote_contiguous = p.remote_contiguous_length().min(p.remote_length);
+        if self.close_if_over_budget(id) {
+            return;
+        }
         self.clear_local_range(core, id, m.start, bits);
         self.update_peer(core, id);
     }
 
-    fn on_range(&mut self, core: &Core, id: PeerId, m: Range) {
-        let fork = core.fork();
+    fn on_range(&mut self, core: &Core, id: PeerId, mut m: Range) {
+        let (fork, local_length) = (core.fork(), core.length());
         let Some(p) = self.peer_mut(id) else { return };
+        // Not in JS: cut the range to what the peer can hold before any bitfield write.
+        m.length = clamp_length(m.start, m.length, p.wire_bound(local_length));
         let has = !m.drop;
         if m.drop && m.start < p.remote_contiguous {
             let end = m.start + m.length;
@@ -2405,11 +2711,12 @@ impl Actor {
         }
         let Some(p) = self.peer_mut(id) else { return };
         if m.start == 0 && !m.drop {
-            if m.length > p.remote_contiguous {
-                p.remote_contiguous = m.length;
+            let contig = m.length.min(p.remote_length);
+            if contig > p.remote_contiguous {
+                p.remote_contiguous = contig;
             }
             if p.remote_fork == fork {
-                core.set_remote_contiguous_length(m.length);
+                core.set_remote_contiguous_length(contig);
             }
         } else if m.length == 1 {
             p.remote_bitfield.set(m.start, has);
@@ -2426,7 +2733,7 @@ impl Actor {
                 p.remote_bitfield.set_range(rs, range_end, has);
                 p.missing_blocks.set_range(rs, range_end, has);
                 if has && m.start <= p.remote_contiguous && p.remote_contiguous < range_end {
-                    p.remote_contiguous = range_end;
+                    p.remote_contiguous = range_end.min(p.remote_length);
                 }
                 if has {
                     self.clear_local_range(core, id, rs, range_end - rs);
@@ -2437,11 +2744,26 @@ impl Actor {
             && has
             && m.start <= p.remote_contiguous
         {
-            p.remote_contiguous = p.remote_contiguous_length();
+            p.remote_contiguous = p.remote_contiguous_length().min(p.remote_length);
+        }
+        if self.close_if_over_budget(id) {
+            return;
         }
         if !m.drop {
             self.update_peer(core, id);
         }
+    }
+
+    /// Not in JS: a peer whose announcements need more than [`PEER_PAGE_BUDGET`] pages
+    /// breaks the protocol and loses its channel. The refused bits read as missing, so
+    /// nothing is requested from it on their account.
+    fn close_if_over_budget(&mut self, id: PeerId) -> bool {
+        let Some(p) = self.peer(id) else { return false };
+        if !(p.remote_bitfield.over_budget() || p.missing_blocks.over_budget()) {
+            return false;
+        }
+        p.tx.close();
+        true
     }
 
     // Reorgs
@@ -2454,6 +2776,15 @@ impl Actor {
             if f.fork == fork {
                 return Some(i);
             }
+        }
+        // Not in JS: track at most MAX_REORGS forks; a newer one replaces the lowest fork
+        // nobody has proven or been asked for yet.
+        if self.reorgs.len() >= MAX_REORGS {
+            let idle = self
+                .reorgs
+                .iter()
+                .position(|f| f.fork < fork && f.batch.is_none() && f.inflight.is_empty())?;
+            self.reorgs.remove(idle);
         }
         self.reorgs.push(ForkReq {
             fork,
@@ -2531,7 +2862,7 @@ impl Actor {
             && let Some(u) = self.upgrade.take()
         {
             for (_, w) in u.waiters {
-                let _ = w.send(false);
+                let _ = w.send(Ok(false));
             }
         }
         if self.upgrade.is_some() {
@@ -2549,9 +2880,21 @@ impl Actor {
 
     fn request_fork_proof(&mut self, core: &Core, id: PeerId, fi: usize) {
         let has_manifest = core.manifest().is_some();
-        let Some(remote_length) = self.peer(id).map(|p| p.remote_length).filter(|&l| l > 0) else {
+        let Some(p) = self.peer(id) else { return };
+        // Not in JS: one fork request in flight per peer, inside its inflight window, so a
+        // stream of `sync`s with rising forks cannot grow our request table.
+        let busy = self
+            .reorgs
+            .iter()
+            .flat_map(|f| &f.inflight)
+            .any(|&r| self.inflight.get(r).is_some_and(|r| r.peer == id));
+        if busy || p.inflight >= p.max_inflight(self.order.len()) {
             return;
-        };
+        }
+        let remote_length = p.remote_length;
+        if remote_length == 0 {
+            return;
+        }
         let Some(mut req) = self.make_request(core, id, false, 0, 0) else {
             return;
         };
@@ -2603,9 +2946,10 @@ impl Actor {
                 index: 2 * index,
                 nodes: want.nodes,
             });
-            if let Some(rid) = self.send_request(core, req) {
-                self.reorgs[fi].inflight.push(rid);
-            }
+            let Some(rid) = self.send_request(core, req) else {
+                return false;
+            };
+            self.reorgs[fi].inflight.push(rid);
             return true;
         }
         let fork = self.reorgs[fi].fork;
@@ -2624,19 +2968,27 @@ impl Actor {
         min_length: u64,
     ) -> Option<Req> {
         let p = self.peer(id)?;
+        // One read of our length, as JS has no await between the check and its use.
+        let (length, has_manifest) = {
+            let st = core.state();
+            (st.tree.length, st.header.manifest.is_some())
+        };
         let mut needs_upgrade = needs_upgrade;
-        if needs_upgrade && !self.should_upgrade(core, p) {
+        if needs_upgrade && !self.should_upgrade(length, p) {
             return None;
         }
         if p.remote_length < min_length {
             return None;
         }
-        if !needs_upgrade && self.auto_upgrade(core, p) {
+        if !needs_upgrade && self.auto_upgrade(core, length, p) {
             needs_upgrade = true;
         }
-        let (length, has_manifest) = {
-            let st = core.state();
-            (st.tree.length, st.header.manifest.is_some())
+        let upgrade = match needs_upgrade {
+            true => Some(RequestUpgrade {
+                start: length,
+                length: p.remote_length.checked_sub(length)?,
+            }),
+            false => None,
         };
         Some(Req {
             peer: id,
@@ -2645,10 +2997,7 @@ impl Actor {
             block: None,
             hash: None,
             seek: None,
-            upgrade: needs_upgrade.then(|| RequestUpgrade {
-                start: length,
-                length: p.remote_length - length,
-            }),
+            upgrade,
             manifest: !has_manifest && p.remote_has_manifest,
             priority,
             timestamp: Instant::now(),
@@ -2656,7 +3005,9 @@ impl Actor {
         })
     }
 
-    /// `peer._send`: registers and sends (or resolves a hash locally).
+    /// `peer._send`: registers and sends (or resolves a hash locally). `None` if nothing was
+    /// sent: the hash resolved locally, or reading our tree failed, which pauses the peer
+    /// rather than send a request with a wrong `nodes` count (JS destroys the stream).
     fn send_request(&mut self, core: &Core, mut req: Req) -> Option<ReqId> {
         let (fork, length) = {
             let st = core.state();
@@ -2664,10 +3015,16 @@ impl Actor {
         };
         if req.fork == fork {
             if let Some(b) = req.block.as_mut() {
-                b.nodes = merkle::missing_nodes(core.storage(), 2 * b.index, length).unwrap_or(0);
+                match merkle::missing_nodes(core.storage(), 2 * b.index, length) {
+                    Ok(nodes) => b.nodes = nodes,
+                    Err(_) => return self.pause(req.peer),
+                }
             }
             if let Some(h) = req.hash.as_mut().filter(|h| h.nodes == 0) {
-                h.nodes = merkle::missing_nodes(core.storage(), h.index, length).unwrap_or(0);
+                match merkle::missing_nodes(core.storage(), h.index, length) {
+                    Ok(nodes) => h.nodes = nodes,
+                    Err(_) => return self.pause(req.peer),
+                }
                 if h.nodes == 0 && h.index & 1 == 0 {
                     let index = h.index / 2;
                     self.resolve_block_request(core, false, index, None, None);
@@ -2689,6 +3046,13 @@ impl Actor {
         Some(rid)
     }
 
+    fn pause(&mut self, id: PeerId) -> Option<ReqId> {
+        if let Some(p) = self.peer_mut(id) {
+            p.paused = true;
+        }
+        None
+    }
+
     fn can_request(&self, core: &Core, p: &Peer, index: u64) -> bool {
         let st = core.state();
         p.remote_length >= st.tree.length
@@ -2696,15 +3060,18 @@ impl Actor {
             || p.can_upgrade
     }
 
-    fn send_block_request(&mut self, core: &Core, mut req: Req, index: u64) {
+    fn send_block_request(&mut self, core: &Core, mut req: Req, index: u64) -> bool {
         req.block = Some(RequestBlock { index, nodes: 0 });
         self.mark_inflight(index);
-        if let Some(rid) = self.send_request(core, req) {
-            if let Some(b) = self.blocks.get_mut(&index) {
-                b.inflight.push(rid);
-            }
-            self.hotswap_add(index);
+        let Some(rid) = self.send_request(core, req) else {
+            self.unmark_inflight(core, index);
+            return false;
+        };
+        if let Some(b) = self.blocks.get_mut(&index) {
+            b.inflight.push(rid);
         }
+        self.hotswap_add(index);
+        true
     }
 
     fn request_block(&mut self, core: &Core, id: PeerId, index: u64) -> bool {
@@ -2716,21 +3083,20 @@ impl Actor {
         let Some(b) = self.blocks.get(&index) else {
             return false;
         };
-        let (priority, force) = (b.priority, b.force);
+        let priority = b.priority;
         if !p.remote_has_block(index) || fork != p.remote_fork {
             if !core.has(index) {
                 self.maybe_want(id, index, Handle::Block(index));
             }
             return false;
         }
-        if !force && !self.can_request(core, p, index) {
+        if !self.can_request(core, p, index) {
             return false;
         }
         let Some(req) = self.make_request(core, id, index >= length, priority, index + 1) else {
             return false;
         };
-        self.send_block_request(core, req, index);
-        true
+        self.send_block_request(core, req, index)
     }
 
     fn maybe_want(&mut self, id: PeerId, index: u64, handle: Handle) {
@@ -2782,8 +3148,7 @@ impl Actor {
         if let Some(index) = last.filter(|&i| i >= core.length() && self.blocks.contains_key(&i))
             && self.peer(id).is_some_and(|p| p.remote_has_block(index))
         {
-            self.send_block_request(core, req, index);
-            return true;
+            return self.send_block_request(core, req, index);
         }
         self.send_request(core, req);
         true
@@ -2809,9 +3174,10 @@ impl Actor {
                 return false;
             };
             req.seek = seek;
-            if let Some(rid) = self.send_request(core, req) {
-                self.seeks[si].inflight.push(rid);
-            }
+            let Some(rid) = self.send_request(core, req) else {
+                return false;
+            };
+            self.seeks[si].inflight.push(rid);
             return true;
         }
         let (start, end, sid) = (s.start, s.end, s.id);
@@ -2857,14 +3223,23 @@ impl Actor {
                 inflight: vec![],
                 queued: false,
                 hotswap: None,
-                force: false,
                 waiters: vec![],
             });
-            if let Some(rid) = self.send_request(core, req) {
-                self.seeks[si].inflight.push(rid);
-                if let Some(h) = self.hashes.get_mut(&index) {
-                    h.inflight.push(rid);
+            // No progress unless a request went out: the caller moves on instead of
+            // calling again for a seek that still has nothing in flight.
+            let Some(rid) = self.send_request(core, req) else {
+                if self
+                    .hashes
+                    .get(&index)
+                    .is_some_and(|h| h.inflight.is_empty())
+                {
+                    self.hashes.remove(&index);
                 }
+                return false;
+            };
+            self.seeks[si].inflight.push(rid);
+            if let Some(h) = self.hashes.get_mut(&index) {
+                h.inflight.push(rid);
             }
             return true;
         }
@@ -2882,7 +3257,6 @@ impl Actor {
             inflight: vec![],
             queued: false,
             hotswap: None,
-            force: false,
             waiters: vec![],
         });
         if !b.inflight.is_empty() {
@@ -2892,7 +3266,11 @@ impl Actor {
             return false;
         }
         let priority = b.priority;
-        let Some(req) = self.make_request(core, id, index >= length, priority, index + 1) else {
+        let sent = match self.make_request(core, id, index >= length, priority, index + 1) {
+            Some(req) => self.send_block_request(core, req, index),
+            None => false,
+        };
+        if !sent {
             if self
                 .blocks
                 .get(&index)
@@ -2901,8 +3279,7 @@ impl Actor {
                 self.blocks.remove(&index);
             }
             return false;
-        };
-        self.send_block_request(core, req, index);
+        }
         if let Some(b) = self.blocks.get_mut(&index) {
             b.queued = false;
         }
@@ -3061,7 +3438,7 @@ impl Actor {
                 let r = self.ranges.swap_remove(i);
                 self.drop_range_wants(core, &r);
                 for (_, w) in r.waiters {
-                    let _ = w.send(true);
+                    let _ = w.send(Ok(true));
                 }
             } else {
                 i += 1;
@@ -3089,7 +3466,7 @@ impl Actor {
                     self.drop_handle_wants(core, Handle::Seek(s.id));
                     let found = matches!(other, Ok(Some(merkle::Seek::Found(..))));
                     for (_, w) in s.waiters {
-                        let _ = w.send(found);
+                        let _ = w.send(Ok(found));
                     }
                 }
             }
@@ -3121,9 +3498,19 @@ impl Actor {
         let mut rng = rand::thread_rng();
         for q in 0..3 {
             let mut ticks = (3 - q) * 16;
-            let mut candidates = self.hotswaps[q].clone();
-            candidates.shuffle(&mut rng);
-            for index in candidates {
+            // JS `HotswapQueue.pick`: an in-place partial shuffle of the live queue.
+            let mut j = 0;
+            while j < self.hotswaps[q].len() {
+                let r = rng.gen_range(j..self.hotswaps[q].len());
+                self.hotswaps[q].swap(j, r);
+                for k in [j, r] {
+                    let moved = self.hotswaps[q][k];
+                    if let Some(b) = self.blocks.get_mut(&moved) {
+                        b.hotswap = Some((q, k));
+                    }
+                }
+                let index = self.hotswaps[q][j];
+                j += 1;
                 let Some(b) = self.blocks.get(&index) else {
                     continue;
                 };
@@ -3182,18 +3569,34 @@ impl Actor {
                 return true;
             }
         }
-        let mut queued = self.queued.clone();
-        queued.shuffle(&mut rand::thread_rng());
-        for index in queued {
-            if !self.blocks.get(&index).is_some_and(|b| b.queued) {
-                self.queued.retain(|&i| i != index);
-                continue;
+        // JS `RandomIterator` over the live queue: pick a random unvisited slot, swap it to
+        // the end of the unvisited part, and swap-remove it once it leaves the queue.
+        let mut rng = rand::thread_rng();
+        let mut left = self.queued.len();
+        while left > 0 {
+            left = left.min(self.queued.len());
+            if left == 0 {
+                break;
             }
-            if self.request_block(core, id, index) {
+            let i = rng.gen_range(0..left);
+            left -= 1;
+            self.queued.swap(i, left);
+            let index = self.queued[left];
+            let sent = if self.blocks.get(&index).is_some_and(|b| b.queued) {
+                if !self.request_block(core, id, index) {
+                    continue;
+                }
                 if let Some(b) = self.blocks.get_mut(&index) {
                     b.queued = false;
                 }
-                self.queued.retain(|&i| i != index);
+                true
+            } else {
+                false
+            };
+            if self.queued.get(left) == Some(&index) {
+                self.queued.swap_remove(left);
+            }
+            if sent {
                 return true;
             }
         }
@@ -3209,10 +3612,19 @@ impl Actor {
         {
             return false;
         }
-        let mut order: Vec<usize> = (0..self.ranges.len()).collect();
-        order.shuffle(&mut rand::thread_rng());
-        for ri in order.into_iter().take(MAX_RANGES) {
-            if ri < self.ranges.len() && self.request_range(core, id, ri) {
+        let mut rng = rand::thread_rng();
+        let mut left = self.ranges.len();
+        let mut tried = 0;
+        while left > 0 && tried < MAX_RANGES {
+            left = left.min(self.ranges.len());
+            if left == 0 {
+                break;
+            }
+            let i = rng.gen_range(0..left);
+            left -= 1;
+            self.ranges.swap(i, left);
+            tried += 1;
+            if self.request_range(core, id, left) {
                 return true;
             }
         }
@@ -3300,6 +3712,13 @@ fn add_range_batch(
     false
 }
 
+/// The part of a wire range `[start, start + length)` that ends at or before `bound`, as a
+/// length; never overflows. Every wire `start`/`length` pair goes through it before it
+/// touches state or drives a loop.
+fn clamp_length(start: u64, length: u64, bound: u64) -> u64 {
+    length.min(bound.saturating_sub(start))
+}
+
 fn clamp_range(core: &Core, r: &mut RangeReq) {
     let st = core.state();
     let start = st.bitfield.find_first(false, r.start);
@@ -3381,6 +3800,397 @@ fn is_plain_block(d: &Data, fork: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    async fn writer_core(seed: u8, blocks: &[&[u8]]) -> (tempfile::TempDir, Core) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(dir.path()).unwrap();
+        let core = Core::open(
+            &store,
+            crate::CoreOptions {
+                key_pair: Some(crate::crypto::KeyPair::from_seed(&[seed; 32])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        core.append(blocks).await.unwrap();
+        (dir, core)
+    }
+
+    fn test_actor(core: &Core) -> (Actor, mpsc::UnboundedReceiver<Cmd>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let actor = Actor::new(
+            Arc::downgrade(&core.inner),
+            *core.discovery_key(),
+            tx,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        );
+        (actor, rx)
+    }
+
+    /// A peer over an in-memory link whose channel is open on both ends. Returns its id,
+    /// our mux and the remote's channel.
+    fn add_peer(actor: &mut Actor, core: &Core, key: [u8; 32]) -> (PeerId, Mux, protomux::Channel) {
+        let ((ar, aw), (br, bw)) = protomux::memory::duplex(16);
+        let info = protomux::StreamInfo {
+            handshake_hash: Some([7; 64]),
+            remote_public_key: Some(key),
+            ..Default::default()
+        };
+        let a = Mux::new(ar, aw, info.clone());
+        let b = Mux::new(br, bw, info);
+        let id = actor
+            .peers
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or(actor.peers.len());
+        assert!(actor.make_peer(core, &a));
+        // A valid capability, so the actor may also process the open.
+        let handshake = encode(&Handshake {
+            seeks: true,
+            capability: crypto::replicate_capability(true, core.key(), &[7; 64]),
+        });
+        let remote = b
+            .open_channel(ChannelOptions {
+                id: Some(core.discovery_key()),
+                handshake: &handshake,
+                ..ChannelOptions::new(PROTOCOL)
+            })
+            .unwrap();
+        actor.peer_mut(id).unwrap().remote_opened = true;
+        actor.order.push(id);
+        (id, a, remote)
+    }
+
+    fn sync(peer: PeerId, fork: u64, length: u64) -> Cmd {
+        Cmd::Wire {
+            peer,
+            msg: Wire::Sync(Sync {
+                fork,
+                length,
+                remote_length: 0,
+                can_upgrade: false,
+                uploading: true,
+                downloading: true,
+                has_manifest: false,
+                allow_push: false,
+            }),
+        }
+    }
+
+    fn block_request(peer: PeerId, id: u64, index: u64) -> Cmd {
+        Cmd::Wire {
+            peer,
+            msg: Wire::Request(Request {
+                id,
+                fork: 0,
+                block: Some(RequestBlock { index, nodes: 0 }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn block_req(peer: PeerId, index: u64) -> Req {
+        Req {
+            peer,
+            rt: 0,
+            fork: 0,
+            block: Some(RequestBlock { index, nodes: 0 }),
+            hash: None,
+            seek: None,
+            upgrade: None,
+            manifest: false,
+            priority: 0,
+            timestamp: Instant::now(),
+            cancelled: false,
+        }
+    }
+
+    async fn next_message(channel: &mut protomux::Channel, kind: u64) -> Bytes {
+        loop {
+            let event = tokio::time::timeout(WAIT, channel.recv())
+                .await
+                .expect("a message")
+                .expect("open channel");
+            if let Event::Message(m) = event
+                && m.kind == kind
+            {
+                return m.data.clone();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_ranges_stay_within_the_synced_length_and_page_budget() {
+        let (_dir, core) = writer_core(30, &[b"block"]).await;
+        let (mut actor, mut rx) = test_actor(&core);
+        let (id, _a, _remote) = add_peer(&mut actor, &core, [1; 32]);
+        let range = |start, length| Cmd::Wire {
+            peer: id,
+            msg: Wire::Range(Range {
+                drop: false,
+                start,
+                length,
+            }),
+        };
+        let pages = |actor: &Actor| {
+            let p = actor.peer(id).unwrap();
+            (
+                p.remote_bitfield.page_count(),
+                p.missing_blocks.page_count(),
+            )
+        };
+
+        actor.handle(&core, range(1, 1 << 40)).await;
+        assert_eq!(
+            pages(&actor),
+            (0, 0),
+            "a peer that sent no sync sets nothing"
+        );
+
+        actor.handle(&core, sync(id, 0, 100)).await;
+        actor.handle(&core, range(1, 1 << 40)).await;
+        let p = actor.peer(id).unwrap();
+        assert!(p.remote_bitfield.get(99) && !p.remote_bitfield.get(100));
+        assert_eq!(pages(&actor), (1, 1), "cut to the synced length");
+
+        // A forged length does not lift the page budget.
+        actor.handle(&core, sync(id, 0, (1 << 53) - 1)).await;
+        actor.handle(&core, range(1, 1 << 40)).await;
+        actor
+            .handle(
+                &core,
+                Cmd::Wire {
+                    peer: id,
+                    msg: Wire::Bitfield(WireBitfield {
+                        start: 1 << 50,
+                        bitfield: vec![u32::MAX; 1 << 16],
+                    }),
+                },
+            )
+            .await;
+        let (remote, missing) = pages(&actor);
+        assert!(remote <= PEER_PAGE_BUDGET as usize && missing <= PEER_PAGE_BUDGET as usize);
+        let p = actor.peer(id).unwrap();
+        assert!(p.remote_bitfield.over_budget());
+        assert!(
+            !p.remote_bitfield.get(1 << 30),
+            "a refused range reads as missing"
+        );
+        assert!(
+            p.tx.is_closed(),
+            "the peer over its budget loses its channel"
+        );
+
+        // The actor still serves another peer at once.
+        let (other, _b, mut remote) = add_peer(&mut actor, &core, [2; 32]);
+        actor.handle(&core, block_request(other, 1, 0)).await;
+        let proof = loop {
+            let cmd = tokio::time::timeout(WAIT, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(cmd, Cmd::Proof { .. }) {
+                break cmd;
+            }
+        };
+        actor.handle(&core, proof).await;
+        let data: Data = decode(next_message(&mut remote, MSG_DATA).await).unwrap();
+        assert_eq!(
+            (data.request, data.block.unwrap().value),
+            (1, Bytes::from_static(b"block"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_want_at_the_end_of_the_u64_space_does_not_overflow() {
+        let (_dir, core) = writer_core(31, &[b"block"]).await;
+        let (mut actor, _rx) = test_actor(&core);
+        let (id, _a, _remote) = add_peer(&mut actor, &core, [1; 32]);
+        let want = Want {
+            start: u64::MAX,
+            length: 2,
+            any: true,
+        };
+        actor
+            .handle(
+                &core,
+                Cmd::Wire {
+                    peer: id,
+                    msg: Wire::Want(want),
+                },
+            )
+            .await;
+        actor.on_have(&core, 0, 1, false);
+    }
+
+    #[tokio::test]
+    async fn a_peer_parks_at_most_512_requests() {
+        let (_dir, core) = writer_core(32, &[b"block"]).await;
+        let (mut actor, mut rx) = test_actor(&core);
+        let (id, a, mut remote) = add_peer(&mut actor, &core, [1; 32]);
+        // The first proof is not collected yet, so every later request stays parked.
+        for rid in 1..=513 {
+            actor.handle(&core, block_request(id, rid, 0)).await;
+        }
+        let p = actor.peer(id).unwrap();
+        assert_eq!((p.remote_requests.len(), p.invalid_requests), (512, 1));
+        // The answers run under one cork (JS `_handleRequests`): the refusal reaches the wire
+        // with the answers once the parked requests are served.
+        while !actor.peer(id).unwrap().remote_requests.is_empty() {
+            let cmd = tokio::time::timeout(WAIT, rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            actor.handle(&core, cmd).await;
+        }
+        let refused: NoData = decode(next_message(&mut remote, MSG_NO_DATA).await).unwrap();
+        assert_eq!((refused.request, refused.reason), (513, INVALID_REQUEST));
+
+        // 600 more, none collected: past 512 each is refused, and the 64th invalid request
+        // destroys the connection.
+        for rid in 1001..=1600 {
+            actor.handle(&core, block_request(id, rid, 0)).await;
+        }
+        assert_eq!(actor.peer(id).unwrap().remote_requests.len(), 512);
+        assert!(
+            a.is_destroyed(),
+            "64 refused requests are 64 invalid requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn wants_wait_while_the_mux_is_not_drained() {
+        let (_dir, core) = writer_core(33, &[b"block"]).await;
+        let (mut actor, _rx) = test_actor(&core);
+        // Nobody reads the far end, so the transport backs up.
+        let ((ar, aw), _far) = protomux::memory::duplex(1);
+        let a = Mux::new(
+            ar,
+            aw,
+            protomux::StreamInfo {
+                handshake_hash: Some([7; 64]),
+                ..Default::default()
+            },
+        );
+        assert!(actor.make_peer(&core, &a));
+        let big = vec![0; 3 << 20];
+        for _ in 0..3 {
+            actor.peer(0).unwrap().tx.send_raw(99, &big);
+        }
+        tokio::time::timeout(WAIT, async {
+            while a.is_drained() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let want = Want {
+            start: 0,
+            length: WANT_BATCH,
+            any: false,
+        };
+        for _ in 0..600 {
+            actor
+                .handle(
+                    &core,
+                    Cmd::Wire {
+                        peer: 0,
+                        msg: Wire::Want(want),
+                    },
+                )
+                .await;
+        }
+        assert_eq!(actor.peer(0).unwrap().parked_wants.len(), MAX_PARKED_WANTS);
+        a.destroy();
+    }
+
+    #[tokio::test]
+    async fn rising_forks_from_one_peer_keep_one_fork_request() {
+        let (_dir, core) = writer_core(34, &[b"block"]).await;
+        let (mut actor, _rx) = test_actor(&core);
+        let (id, _a, _remote) = add_peer(&mut actor, &core, [1; 32]);
+        for fork in 1..=100 {
+            actor.handle(&core, sync(id, fork, 5)).await;
+        }
+        assert!(actor.reorgs.len() <= MAX_REORGS);
+        assert_eq!(actor.peer(id).unwrap().inflight, 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_peer_returns_cancelled_request_ids() {
+        let (_dir, core) = writer_core(35, &[b"block"]).await;
+        let (mut actor, _rx) = test_actor(&core);
+        let (id, _a, _remote) = add_peer(&mut actor, &core, [1; 32]);
+        let rid = actor.send_request(&core, block_req(id, 0)).unwrap();
+        actor.cancel_request(&core, rid);
+        assert!(
+            !actor.inflight.free.contains(&rid),
+            "reserved until the remote answers"
+        );
+        actor.on_close(&core, id, false);
+        assert!(actor.inflight.free.contains(&rid));
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_block_answers_names_each_sender() {
+        let (_wdir, writer) = writer_core(36, &[b"zero", b"one"]).await;
+        // A reader that knows the tree (upgrade verified) but holds no block yet.
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::storage::Store::open(dir.path()).unwrap();
+        let core = Core::open(
+            &store,
+            crate::CoreOptions {
+                key: Some(*writer.key()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let upgrade = ProofRequest {
+            upgrade: Some(RequestUpgrade {
+                start: 0,
+                length: 2,
+            }),
+            ..Default::default()
+        };
+        let upgrade = writer.proof_for(&upgrade, true).unwrap();
+        assert_eq!(core.verify(upgrade, None).await.unwrap(), Some(true));
+        let (mut actor, rx) = test_actor(&core);
+        let (a, _ma, _ra) = add_peer(&mut actor, &core, [1; 32]);
+        let (b, _mb, _rb) = add_peer(&mut actor, &core, [2; 32]);
+        let ra = actor.send_request(&core, block_req(a, 0)).unwrap();
+        let rb = actor.send_request(&core, block_req(b, 1)).unwrap();
+        let mut events = core.events();
+        let tx = actor.tx.clone();
+        // Both answers are queued before the actor runs, so it sees them together.
+        for (peer, rid) in [(a, ra), (b, rb)] {
+            let block = actor.inflight.get(rid).unwrap().block;
+            let req = ProofRequest {
+                block,
+                ..Default::default()
+            };
+            let mut data = writer.proof_for(&req, false).unwrap();
+            data.request = rid;
+            let msg = Wire::Data(Box::new(data));
+            assert!(tx.send(Cmd::Wire { peer, msg }).is_ok());
+        }
+        let run = tokio::spawn(actor.run(rx, core.inner.store.closed()));
+        let mut from = HashMap::new();
+        while from.len() < 2 {
+            let event = tokio::time::timeout(WAIT, events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let crate::CoreEvent::Download { index, from: f, .. } = event {
+                from.insert(index, f);
+            }
+        }
+        assert_eq!(from[&0], Some([1; 32]));
+        assert_eq!(from[&1], Some([2; 32]));
+        let _ = tx.send(Cmd::Destroy);
+        run.await.unwrap();
+    }
 
     #[test]
     fn udx_inflight_window_matches_js_latency_and_peer_scaling() {

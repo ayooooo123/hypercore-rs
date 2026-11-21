@@ -111,8 +111,11 @@ impl Iter {
     pub fn seek(&mut self, index: u64) {
         self.index = index;
         if index & 1 == 1 {
+            let depth = depth(index);
+            // `2 << 63` is 0, and a zero factor makes every walk stand still.
+            assert!(depth < 63, "flat-tree index {index} is out of range");
             self.offset = offset(index);
-            self.factor = 2 << depth(index);
+            self.factor = 2 << depth;
         } else {
             self.offset = index / 2;
             self.factor = 2;

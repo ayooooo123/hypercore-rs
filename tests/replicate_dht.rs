@@ -168,6 +168,8 @@ async fn js_swarm_writes_rust_swarm_reads() {
     )
     .unwrap();
     let _session = core.session(true);
+    // As JS apps do: without a findingPeers guard, an update before the first peer is `false`.
+    let _finding = core.finding_peers();
     let (swarm, conns) = rust_swarm(&port).await;
     replicate_all(core.clone(), conns);
     swarm.join(*core.discovery_key(), opts(true)).await.unwrap();
@@ -304,6 +306,7 @@ async fn rust_swarm_writes_rust_swarm_reads() {
     )
     .unwrap();
     let _reader_session = reader.session(true);
+    let _finding = reader.finding_peers();
     let (client, conns) = rust_swarm(&port).await;
     replicate_all(reader.clone(), conns);
     client

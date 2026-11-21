@@ -48,19 +48,24 @@ let block = reader.get(1, GetOptions::default()).await?;
   head, the discovery-key index, aliases, groups, and per core the auth row, head, hints, every
   block, tree node, bitfield page and user-data entry. A directory written by corestore 7.16.1 on
   node can be opened here and the reverse, so both stacks can take turns on one directory.
-- `Core::events` exposes append, replicated download, truncation, peer and close notifications;
-  `subscribe` remains available for head changes. User metadata is persisted with `set_user_data`,
-  and `GetOptions::raw` returns stored ciphertext without decrypting.
+- `Core::events` exposes append, replicated download, truncation, conflict, peer and close
+  notifications; `subscribe` remains available for head changes. User metadata is persisted with
+  `set_user_data`, and `GetOptions::raw` returns stored ciphertext without decrypting.
 - `RequestBag` cancels pending and subsequent reads with a sticky reason; pass it through
   `GetOptions::bag` or `download_with_bag`. Cancellation is scoped to that bag.
 - `Core::replicate` registers its Protomux pairer synchronously, so callers may mark the mux
   ready immediately, including when the remote core open arrived during setup. Closed cores
   leave pairing to corestore so a stored core can be reopened on demand.
 
-Not ported: push mode, repair mode, protocol extensions, block-list ranges, sessions on named
-branches/snapshots/atoms. Hosts attach live UDX RTT with `Mux::set_udx_rtt` before replication:
-the request window then uses JS's 50 ms latency scaling and live peer-count factor,
-bounded by the configured range. Other transports retain the JS non-UDX limit.
+Not ported: push mode, repair mode, recovery mode (npm `store.setRecovering()`), protocol
+extensions, block-list ranges, sessions on named branches/snapshots/atoms. Hosts attach live UDX
+RTT with `Mux::set_udx_rtt` before replication: the request window then uses JS's 50 ms latency
+scaling and live peer-count factor, bounded by the configured range. Other transports retain the
+JS non-UDX limit.
+
+Open a key once per process and share the `Core` handle (it is `Clone`). `Core::open` keeps no
+registry: two `Core`s on one key are two writers with separate locks and trees, and they corrupt
+the log. corestore-rs dedupes opens by discovery key, as npm corestore does.
 
 ## Compatibility
 
@@ -194,6 +199,47 @@ smaller cache cap, wire/storage changes, or speculative peer-state rewrites.
 Corestore, Protomux and wakeup lifecycle logic is unchanged. All five crates'
 `cargo test -- --include-ignored` and `cargo clippy --all-targets -- -D warnings`
 pass, including storage switching, JS interop and pairing/teardown regressions.
+
+## Deviations from npm
+
+- Wire geometry is bounded. A request or proof whose block index, `start + length`, or any
+  carried tree-node index lies past a tree of 2^52 blocks fails with `INVALID_OPERATION` (request)
+  or `INVALID_PROOF` (proof), and a request for more than 64 nodes fails with
+  `Nodes is out of bounds`. JS computes these in floats and fails later on the same inputs; no
+  valid tree reaches the bound.
+- Conflict evidence is a pure upgrade only. A `request == 0` proof that also carries a block, hash
+  or seek never freezes the core (npm freezes on a replay of an honest proof of that shape). The
+  remote roots are the verified leading roots of the upgrade, not every upgrade node.
+- A frozen core refuses `append` with `CoreError::Conflict`; npm closes all its sessions instead.
+  As in npm, the freeze is in memory only and a reopen clears it.
+- A non-zero `hints.recovering` (npm's recovery hint) is kept as stored, and `append` fails with
+  `CoreError::Recovering` instead of waiting for recovery peers.
+- An unsigned `append_with(.., AppendOptions { writable: true, .. })` needs a quorum-0 manifest
+  whose prologue length is the new length; past the prologue it fails with `NotWritable`. npm
+  accepts it and writes a head no peer can verify.
+- On an encrypted core, a block shorter than the 8-byte padding reads as empty (as npm), and byte
+  lengths, offsets and seeks clamp at zero where JS would go negative.
+- A wire `range` or `bitfield` is cut to the peer's synced length (the larger of its `sync` length
+  and ours); a peer that sent no `sync` sets nothing. `remote_contiguous` never passes the peer's
+  `sync` length.
+- Each peer's `remote_bitfield` and `missing_blocks` hold at most 1024 pages each (4 MiB, 33.5
+  million blocks, 16 TiB of 512 KiB blobs). A peer whose announcements need more loses its
+  channel; the refused bits read as missing. Ranges from block 0 cost no page.
+- A peer may have at most 512 requests parked or in progress. More are answered
+  `noData{INVALID_REQUEST}` and count as invalid requests (64 destroy the connection).
+- `want` messages are answered only while the mux is drained; up to 512 wait for the drain, more
+  are dropped.
+- One fork-proof request is in flight per peer, inside its inflight window, and at most 16 forks
+  are tracked.
+- Proofs are built on a blocking thread, one per peer at a time. Answers to one peer keep request
+  order, except that high-priority requests that arrive while an answer is being built go first,
+  newest first (npm applies that order only when the transport is backed up). No wire change.
+- A malformed extension message is skipped; npm's protomux destroys the connection.
+- A local storage read failure while building a request pauses that peer (npm destroys the
+  stream).
+- `CoreEvent` is delivered through a bounded broadcast channel of 256 events. A subscriber that
+  falls behind gets `RecvError::Lagged` and loses events; do not count `Download` events to measure
+  progress (npm emits each event synchronously and loses none).
 
 ## License
 

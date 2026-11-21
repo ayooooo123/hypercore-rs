@@ -160,8 +160,12 @@ impl Verifier {
                 }
                 tree = &patched;
             }
+            // Compare in `u64`: `as usize` truncates on 32-bit targets.
+            if inp.signer >= self.signers.len() as u64 {
+                return false;
+            }
             let i = inp.signer as usize;
-            if i >= self.signers.len() || tried[i] {
+            if tried[i] {
                 return false;
             }
             tried[i] = true;
@@ -232,6 +236,10 @@ fn generate_upgrade(
     length: u64,
 ) -> Option<DataUpgrade> {
     let patch = patch?;
+    // `verify_upgrade` refuses this length anyway; stop before the walk can overflow.
+    if crate::merkle::beyond_max_length(start, length) {
+        return None;
+    }
     let mut nodes: Option<Vec<Node>> = None;
     let from = start * 2;
     let to = from + length * 2;

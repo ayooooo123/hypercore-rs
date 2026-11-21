@@ -85,12 +85,13 @@ pub fn block_node(index: u64, data: &[u8]) -> Node {
     }
 }
 
-/// Parent hash; the children are ordered by index.
+/// Parent hash; the children are ordered by index. Sizes add as `u64` modulo 2^64:
+/// peer-sent sizes that overflow can only fail verification, never panic.
 pub fn parent_hash(a: &Node, b: &Node) -> [u8; 32] {
     let (a, b) = if a.index > b.index { (b, a) } else { (a, b) };
     hash(&[
         &[PARENT_TYPE],
-        &(a.size + b.size).to_le_bytes(),
+        &a.size.wrapping_add(b.size).to_le_bytes(),
         &a.hash,
         &b.hash,
     ])
@@ -99,7 +100,7 @@ pub fn parent_hash(a: &Node, b: &Node) -> [u8; 32] {
 pub fn parent_node(index: u64, a: &Node, b: &Node) -> Node {
     Node {
         index,
-        size: a.size + b.size,
+        size: a.size.wrapping_add(b.size),
         hash: parent_hash(a, b),
     }
 }
