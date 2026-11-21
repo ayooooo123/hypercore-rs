@@ -221,7 +221,10 @@ pass, including storage switching, JS interop and pairing/teardown regressions.
   lengths, offsets and seeks clamp at zero where JS would go negative.
 - A wire `range` or `bitfield` is cut to the peer's synced length (the larger of its `sync` length
   and ours); a peer that sent no `sync` sets nothing. `remote_contiguous` never passes the peer's
-  `sync` length.
+  `sync` length. A `range` that reaches past that length is kept (the last 8 per peer) and applied
+  at the peer's next `sync`: npm sends the `range` of an append before its `sync` when it re-checks
+  the upgrade first, and a reader that already wants the segment gets no other notice. The cut
+  part of a `bitfield` is not kept.
 - Each peer's `remote_bitfield` and `missing_blocks` hold at most 1024 pages each (4 MiB, 33.5
   million blocks, 16 TiB of 512 KiB blobs). A peer whose announcements need more loses its
   channel; the refused bits read as missing. Ranges from block 0 cost no page.

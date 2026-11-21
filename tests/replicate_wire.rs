@@ -579,3 +579,86 @@ async fn parked_priority_requests_are_answered_newest_first() {
     assert_eq!(late, [b - 1, b - 2, b - 3, a, b], "answer order {order:?}");
     assert_eq!(fill, (1..=FILL).collect::<Vec<_>>());
 }
+
+/// `replicator.js` `signalUpgrade`: a writer that must first re-check whether the peer can be
+/// upgraded (`_updateCanUpgradeAndSync`) sends the `sync` of an append after its `range`. A
+/// reader that already wants the segment sends no second `want`, so that `range` is its only
+/// notice of the new block: the part past the synced length is kept and applied at the `sync`.
+#[tokio::test]
+async fn a_range_sent_ahead_of_its_sync_still_announces_the_block() {
+    let dirs: Vec<_> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
+    let stores: Vec<_> = dirs
+        .iter()
+        .map(|d| Store::open(d.path()).unwrap())
+        .collect();
+    let w = writer(&stores[0], 53);
+    w.append(&[b"0".as_slice()]).await.unwrap();
+    let r = reader(&stores[1], w.key());
+    let _session = r.session(true);
+
+    let ((ar, aw), (br, bw)) = memory::duplex(64);
+    let (r_mux, r_remote) = (Mux::new(ar, aw, info(false)), Mux::new(br, bw, info(true)));
+    let ((ar, aw), (br, bw)) = memory::duplex(64);
+    let (w_mux, w_remote) = (Mux::new(ar, aw, info(false)), Mux::new(br, bw, info(true)));
+    r.replicate(&r_mux);
+    w.replicate(&w_mux);
+    let mut to_r = open(&r_remote, &r).await;
+    let mut to_w = open(&w_remote, &w).await;
+    let (wanted, mut wants) = mpsc::unbounded_channel();
+    // Forwards every message. The writer's `sync` for length 2 is held until the `range` that
+    // follows it has gone out: the order npm sends them in on its asynchronous path.
+    tokio::spawn(async move {
+        let mut held = None;
+        let mut swapped = false;
+        loop {
+            let (from_r, event) = tokio::select! {
+                e = to_r.recv() => (true, e),
+                e = to_w.recv() => (false, e),
+            };
+            let m = match event {
+                Some(Event::Message(m)) => m,
+                Some(Event::Opened { .. }) => continue,
+                Some(Event::Closed { .. }) | None => break,
+            };
+            if from_r {
+                if m.kind == WANT {
+                    let _ = wanted.send(());
+                }
+                to_w.send_raw(m.kind, &m.data);
+            } else if !swapped
+                && m.kind == SYNC
+                && decode::<Sync>(m.data.clone()).unwrap().length == 2
+            {
+                swapped = true;
+                held = Some(m.data.clone());
+            } else {
+                to_r.send_raw(m.kind, &m.data);
+                if m.kind == RANGE
+                    && let Some(sync) = held.take()
+                {
+                    to_r.send_raw(SYNC, &sync);
+                }
+            }
+        }
+    });
+
+    let first = timeout(T, r.get(0, GetOptions::default())).await.unwrap();
+    assert_eq!(first.unwrap().as_deref(), Some(&b"0"[..]));
+    // The reader asks for the next block before it exists, which registers its `want`.
+    let get = tokio::spawn({
+        let r = r.clone();
+        async move { r.get(1, GetOptions::default()).await }
+    });
+    timeout(T, wants.recv())
+        .await
+        .expect("the reader wants the segment")
+        .unwrap();
+    eventually(|| async { r.pending_requests().await == 1 }).await;
+
+    w.append(&[b"1".as_slice()]).await.unwrap();
+    let block = timeout(T, get)
+        .await
+        .expect("the reader asks for the block the early range announced")
+        .unwrap();
+    assert_eq!(block.unwrap().as_deref(), Some(&b"1"[..]));
+}

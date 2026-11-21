@@ -63,6 +63,10 @@ const MAX_REORGS: usize = 16;
 /// 1024 pages of 32768 bits, 4 MiB, describe 33.5 million blocks, 16 TiB of 512 KiB blobs.
 /// Ranges from 0 use `remote_contiguous` and cost no page.
 const PEER_PAGE_BUDGET: u64 = 1024;
+/// `range` messages kept when they reach past the peer's synced length (JS: no bound). npm
+/// announces an append with `range` before `sync` when it re-checks the upgrade first
+/// (`signalUpgrade` → `_updateCanUpgradeAndSync`); the kept ranges are applied at that `sync`.
+const EARLY_RANGES: usize = 8;
 
 const PRIORITY_NORMAL: u64 = 0;
 const PRIORITY_HIGH: u64 = 1;
@@ -621,6 +625,8 @@ struct Peer {
     last_upgradable_length: u64,
     last_upgradable_fork: u64,
     remote_contiguous: u64,
+    /// Non-drop ranges that reached past the synced length, oldest first; see [`EARLY_RANGES`].
+    early_ranges: VecDeque<Range>,
     remote_opened: bool,
     remote_bitfield: RemoteBitfield,
     missing_blocks: RemoteBitfield,
@@ -1110,6 +1116,7 @@ impl Actor {
             last_upgradable_length: 0,
             last_upgradable_fork: 0,
             remote_contiguous: 0,
+            early_ranges: VecDeque::new(),
             remote_opened: false,
             remote_bitfield: RemoteBitfield::with_page_budget(PEER_PAGE_BUDGET),
             missing_blocks: RemoteBitfield::with_page_budget(PEER_PAGE_BUDGET),
@@ -2085,6 +2092,14 @@ impl Actor {
         if fork == p.remote_fork && length > p.remote_length {
             self.signal_upgrade(core, id);
         }
+        // The peer's length is known now: apply what it announced ahead of this `sync`.
+        let early = self
+            .peer_mut(id)
+            .map(|p| std::mem::take(&mut p.early_ranges))
+            .unwrap_or_default();
+        for range in early {
+            self.on_range(core, id, range);
+        }
         self.update_peer(core, id);
     }
 
@@ -2693,8 +2708,18 @@ impl Actor {
     fn on_range(&mut self, core: &Core, id: PeerId, mut m: Range) {
         let (fork, local_length) = (core.fork(), core.length());
         let Some(p) = self.peer_mut(id) else { return };
-        // Not in JS: cut the range to what the peer can hold before any bitfield write.
-        m.length = clamp_length(m.start, m.length, p.wire_bound(local_length));
+        // Not in JS: cut the range to what the peer can hold before any bitfield write. A
+        // range that reaches past it is kept for the peer's next `sync`.
+        let bound = p.wire_bound(local_length);
+        if m.drop {
+            p.early_ranges.clear();
+        } else if m.start.saturating_add(m.length) > bound {
+            if p.early_ranges.len() == EARLY_RANGES {
+                p.early_ranges.pop_front();
+            }
+            p.early_ranges.push_back(m);
+        }
+        m.length = clamp_length(m.start, m.length, bound);
         let has = !m.drop;
         if m.drop && m.start < p.remote_contiguous {
             let end = m.start + m.length;
