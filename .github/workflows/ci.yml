@@ -36,6 +36,10 @@ jobs:
           path: hypercore-storage-rs
       - uses: actions/checkout@v4
         with:
+          repository: ${{ github.repository_owner }}/tinyrocks-rs
+          path: tinyrocks-rs
+      - uses: actions/checkout@v4
+        with:
           repository: ${{ github.repository_owner }}/hyperschema-rs
           path: hyperschema-rs
       - uses: actions/checkout@v4
