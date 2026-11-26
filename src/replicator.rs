@@ -744,9 +744,14 @@ struct Actor {
     if_available: i64,
     manifest_peer: Option<PeerId>,
     attached: Vec<Mux>,
+    last_reopen: Option<std::time::Instant>,
     applying_reorg: bool,
     destroyed: bool,
 }
+
+/// Minimum interval between re-probing attached peers whose channel closed while
+/// this core still had pending block/range requests.
+const REOPEN_COOLDOWN: Duration = Duration::from_secs(2);
 
 fn backoff(times: u64) -> Duration {
     Duration::from_millis(match times {
@@ -813,6 +818,7 @@ impl Actor {
             if_available: 0,
             manifest_peer: None,
             attached: vec![],
+            last_reopen: None,
             applying_reorg: false,
             destroyed: false,
         }
@@ -1505,11 +1511,13 @@ impl Actor {
             self.signal_upgrade(core, id);
         }
         if downloading {
+            self.attached.retain(|m| !m.is_destroyed());
             for mux in self.attached.clone() {
                 if !mux.is_destroyed() {
                     self.make_peer(core, &mux);
                 }
             }
+            self.last_reopen = Some(std::time::Instant::now());
         } else {
             for id in self.order.clone() {
                 self.close_if_idle(id);
@@ -1553,6 +1561,36 @@ impl Actor {
             self.queued.push(index);
         }
         self.update_all(core);
+        if self
+            .blocks
+            .get(&index)
+            .is_some_and(|b| b.inflight.is_empty())
+        {
+            self.reopen_attached(core);
+        }
+    }
+
+    /// Re-opens replication channels on live attached connections that closed
+    /// while this core stayed downloading (for example after a remote relay
+    /// evicted an idle core during our 20-40 s `not_downloading_slack` window).
+    fn reopen_attached(&mut self, core: &Core) {
+        self.attached.retain(|m| !m.is_destroyed());
+        let now = std::time::Instant::now();
+        if self
+            .last_reopen
+            .is_some_and(|prev| now.duration_since(prev) < REOPEN_COOLDOWN)
+        {
+            return;
+        }
+        let mut attempted = false;
+        for mux in self.attached.clone() {
+            if !mux.is_destroyed() && self.make_peer(core, &mux) {
+                attempted = true;
+            }
+        }
+        if attempted {
+            self.last_reopen = Some(now);
+        }
     }
 
     fn add_upgrade(&mut self, core: &Core, waiter: WaiterId, reply: BoolReply) {
@@ -1607,6 +1645,9 @@ impl Actor {
         }
         self.ranges.push(r);
         self.update_all(core);
+        if self.inflight.idle() {
+            self.reopen_attached(core);
+        }
     }
 
     fn cancel(&mut self, core: &Core, waiter: WaiterId) {
