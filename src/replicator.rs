@@ -1561,7 +1561,11 @@ impl Actor {
             self.queued.push(index);
         }
         self.update_all(core);
-        if self.blocks.get(&index).is_some_and(|b| b.inflight.is_empty()) {
+        if self
+            .blocks
+            .get(&index)
+            .is_some_and(|b| b.inflight.is_empty())
+        {
             self.reopen_attached(core);
         }
     }
